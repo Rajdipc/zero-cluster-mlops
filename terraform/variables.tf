@@ -57,6 +57,25 @@ variable "max_slot_millis_warning" {
   default     = 300000
 }
 
+variable "min_row_count" {
+  type        = number
+  description = <<-EOT
+    Minimum row count the target partition must contain before scoring proceeds.
+
+    The default of 1 is deliberately a bare presence check: it catches a
+    partition that is entirely missing, which is the failure this blueprint can
+    detect without knowing your data. It does NOT catch a partially loaded
+    partition.
+
+    To catch partial loads, raise this to roughly half of your typical daily
+    volume once you know what typical looks like. Query the feature table for
+    the p50 row count per partition over the last 30 days and halve it. A
+    partition below that is far more likely to be a broken upstream job than a
+    genuinely quiet day.
+  EOT
+  default     = 1
+}
+
 variable "enable_demo_ingestion" {
   type        = bool
   description = <<-EOT
@@ -97,6 +116,42 @@ variable "demo_source_table" {
 
     The year here must match the year in demo_source_window_start; the container
     validates this at startup and refuses to run on a mismatch.
+
+    Ignored entirely when enable_demo_ingestion is false.
+  EOT
+}
+
+variable "demo_source_window_start" {
+  type        = string
+  default     = "2022-02-01"
+  description = <<-EOT
+    First day of the historical window that demo ingestion cycles through.
+
+    This is one half of a coupled pair: its year MUST match the year in
+    demo_source_table. The container enforces that at startup and exits with a
+    validation error rather than silently ingesting zero rows.
+
+    Both halves are declared here precisely so that changing the demo year is a
+    single coherent edit. Exposing only the table -- as an earlier revision of
+    this file did -- makes the container's own error message unactionable,
+    because it names an environment variable the operator has no way to set.
+
+    Ignored entirely when enable_demo_ingestion is false.
+  EOT
+}
+
+variable "demo_source_window_days" {
+  type        = number
+  default     = 28
+  description = <<-EOT
+    Length in days of the demo source window. The target date is mapped onto the
+    window modulo this value, so the demo keeps producing a plausible partition
+    indefinitely instead of running out of source data after one night.
+
+    28 rather than 30 or 31 so the mapping preserves day-of-week alignment:
+    taxi volume has a strong weekly cycle, and a 30-day rotation would drift
+    weekday data onto weekend dates and manufacture drift that is an artifact of
+    the demo rather than a property of the data.
 
     Ignored entirely when enable_demo_ingestion is false.
   EOT

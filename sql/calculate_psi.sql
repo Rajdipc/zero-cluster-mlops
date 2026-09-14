@@ -36,20 +36,47 @@ bins AS (
     percentiles[OFFSET(offset + 1)] AS max_val
   FROM quantiles, UNNEST(GENERATE_ARRAY(0, 9)) AS offset
 ),
+-- ------------------------------------------------------------------------------
+-- Bin membership. The first and last bins are OPEN-ENDED, and that matters more
+-- than it looks.
+--
+-- The bin edges come from the BASELINE's deciles, so they span only the range
+-- the baseline happened to cover. With closed edges, a scoring row outside that
+-- range matches no bin at all: it disappears from the per-bin counts while
+-- still being counted in total_s, the denominator. Every actual_pct shrinks
+-- slightly and PSI goes DOWN.
+--
+-- That is exactly backwards. A fare distribution shifting outside its historical
+-- range is the single most obvious kind of drift -- a pricing change, a new
+-- surcharge, a units bug -- and closed bins make the detector quieter precisely
+-- as the drift gets worse. Modelled against these thresholds, 30% of a partition
+-- could land outside the baseline range and still score 0.107, comfortably under
+-- the 0.25 halt.
+--
+-- Open edges send those rows to bin 0 or bin 9, where they inflate that bin's
+-- actual_pct and raise PSI, which is the behaviour the metric is supposed to have.
+--
+--   bin 0 : (-inf, p10)   -- everything below the baseline minimum
+--   bin 1-8: [p_n, p_n+1) -- half-open, so no row is counted twice
+--   bin 9 : [p90, +inf)   -- everything at or above the baseline maximum
+--
+-- The bins remain mutually exclusive and collectively exhaustive, so every
+-- non-NULL row lands in exactly one.
+-- ------------------------------------------------------------------------------
 baseline_counts AS (
   SELECT b.bin_id, COUNT(1) AS cnt
   FROM baseline_data d
   JOIN bins b
-    ON d.feature_val >= b.min_val
-   AND (d.feature_val < b.max_val OR (b.bin_id = 9 AND d.feature_val <= b.max_val))
+    ON (d.feature_val >= b.min_val OR b.bin_id = 0)
+   AND (d.feature_val <  b.max_val OR b.bin_id = 9)
   GROUP BY b.bin_id
 ),
 scoring_counts AS (
   SELECT b.bin_id, COUNT(1) AS cnt
   FROM scoring_data d
   JOIN bins b
-    ON d.feature_val >= b.min_val
-   AND (d.feature_val < b.max_val OR (b.bin_id = 9 AND d.feature_val <= b.max_val))
+    ON (d.feature_val >= b.min_val OR b.bin_id = 0)
+   AND (d.feature_val <  b.max_val OR b.bin_id = 9)
   GROUP BY b.bin_id
 ),
 total_counts AS (

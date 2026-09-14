@@ -178,3 +178,90 @@ def test_view_projection_parser_finds_the_real_columns():
     assert "total_amount" not in exposed, (
         "total_amount is back in the view projection. That is the target leak."
     )
+
+
+# ==============================================================================
+# Numeric claims in the README.
+#
+# A later review found three stale numbers: the README advertised a test count
+# that was two revisions old, claimed "three child spans" where the code emits
+# four, and the blog post quoted a line count off by more than 2x. None of these
+# break anything. All of them cost the reader trust, because they are the parts
+# a reader can most easily check.
+#
+# Numbers that can be derived should be derived, and numbers that must be
+# written down should be pinned to their source.
+# ==============================================================================
+def _readme_text() -> str:
+    return README.read_text(encoding="utf-8")
+
+
+def test_advertised_test_count_matches_reality():
+    """The README tells readers what `make test` should print. Keep it true."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", str(REPO_ROOT / "tests")],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+    )
+    match = re.search(r"(\d+) tests? collected", result.stdout)
+    assert match, f"could not parse collected count from pytest output:\n{result.stdout[-2000:]}"
+    actual = int(match.group(1))
+
+    claimed = set(int(n) for n in re.findall(r"\*\*(\d+) passed\*\*", _readme_text()))
+    claimed |= set(int(n) for n in re.findall(r"#\s*(\d+) tests", _readme_text()))
+
+    assert claimed, "README no longer states a test count; if that is deliberate, delete this test"
+    assert claimed == {actual}, (
+        f"README claims {sorted(claimed)} tests; pytest collects {actual}. "
+        f"Update the README (both the `make test` expectation and the repo tree)."
+    )
+
+
+def test_advertised_child_span_count_matches_the_code():
+    """`with tracer.start_as_current_span(...)` is countable. Count it."""
+    src = REPO_ROOT / "src"
+    spans = set()
+    for path in src.glob("*.py"):
+        if path.name == "orchestrator.py":
+            continue  # the root span, not a child
+        spans |= set(
+            re.findall(r'start_as_current_span\(\s*"([^"]+)"', path.read_text(encoding="utf-8"))
+        )
+
+    assert len(spans) == 4, (
+        f"expected 4 child spans, found {len(spans)}: {sorted(spans)}. "
+        f"If a phase was added or removed, update the README's Observability section."
+    )
+
+    text = _readme_text()
+    for name in spans:
+        assert name in text, f"child span {name} is not documented in the README"
+
+    assert "three child spans" not in text, (
+        "README says 'three child spans' but the code emits four "
+        "(ingest, drift, evaluate, inference) in the default configuration."
+    )
+
+
+def test_documented_exit_codes_match_the_orchestrator():
+    """The troubleshooting table names exit codes by number."""
+    from src.orchestrator import EXIT_GUARDRAIL_HALT, EXIT_OK, EXIT_UNEXPECTED
+
+    text = _readme_text()
+    assert f"`{EXIT_GUARDRAIL_HALT}`" in text, "the terminal exit code is not documented"
+    assert f"`{EXIT_UNEXPECTED}`" in text, "the transient exit code is not documented"
+    assert EXIT_OK == 0
+
+
+def test_readme_does_not_advertise_a_fixed_image_tag():
+    """A hard-coded tag in the docs re-creates the mutable-tag defect by example."""
+    text = _readme_text()
+    assert "worker:v1.0.0" not in text, (
+        "README shows a fixed image tag. The Makefile derives the tag from the "
+        "commit precisely so Terraform notices when the image changes; "
+        "documenting a constant tag teaches readers the failure mode back."
+    )

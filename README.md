@@ -228,7 +228,7 @@ make install
 make test
 ```
 
-Expect **47 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
+Expect **103 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
 
 ### Step 5 — Seed BigQuery and train  ⚠️ *first step that costs money*
 
@@ -254,7 +254,18 @@ Four things happen, in order:
 make docker-push
 ```
 
-Creates the Artifact Registry repo if absent, configures Docker auth, builds and pushes `worker:v1.0.0`. **2–4 minutes.**
+Creates the Artifact Registry repo if absent, configures Docker auth, builds and pushes the image. **2–4 minutes.**
+
+The tag is **derived from your commit**, not fixed. On a clean checkout it is the short SHA (e.g. `worker:51bbb57`); with uncommitted changes it gains a timestamp suffix (`worker:51bbb57-dirty-20260914190000`). Run `make help` to see the exact URI.
+
+> [!IMPORTANT]
+> A fixed tag like `v1.0.0` looks tidier and is a trap. Re-pushing the same tag leaves Terraform seeing an unchanged `container_image`, so it reports "No changes" and the Job keeps running the digest it resolved the first time. You change code, push, apply, execute — and observe the *old* behaviour while every command reports success.
+>
+> The cost of a commit-derived tag is that `make docker-push` and `make tf-apply` must see the same tag. If you commit or edit between the two, `tf-apply` will point at an image that was never pushed and Cloud Run will fail to start the task. That failure is loud and immediate, which is the point. To avoid it entirely, use one invocation:
+>
+> ```bash
+> make deploy      # docker-push + tf-apply, guaranteed-matching tag
+> ```
 
 <details>
 <summary>Docker unavailable or misbehaving? Use Cloud Build instead.</summary>
@@ -265,11 +276,18 @@ gcloud services enable cloudbuild.googleapis.com
 gcloud artifacts repositories create bqml-batch-inference \
   --repository-format=docker --location="$GCP_REGION" 2>/dev/null || true
 
+# Match the tag the Makefile would have produced, so `make tf-apply` finds it.
+IMAGE_TAG="$(git rev-parse --short HEAD)"
+
 gcloud builds submit \
-  --tag "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/bqml-batch-inference/worker:v1.0.0" .
+  --tag "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/bqml-batch-inference/worker:${IMAGE_TAG}" .
 ```
 
-The image URI is identical, so Step 7 is unchanged.
+Then pass the same tag through to Terraform:
+
+```bash
+make tf-apply IMAGE_TAG="$IMAGE_TAG"
+```
 
 </details>
 
@@ -407,10 +425,14 @@ zero-cluster-mlops/
 │   ├── seed_and_train.sh       # Idempotent: creates objects, loads data, trains
 │   └── run_local.sh            # Local orchestrator execution
 │
-└── tests/                      # 47 tests, no cloud access required
+└── tests/                      # 103 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
-    ├── test_docs_contract.py   # stops README SQL drifting from the real view
+    ├── test_terraform_contract.py # Terraform <-> container config seam
+    ├── test_docs_contract.py   # stops this README drifting from the code
+    ├── test_psi_bins.py        # parses the shipped PSI predicate and exercises it
+    ├── test_orchestrator.py    # exit codes, halt-blocks-scoring, telemetry flush
+    ├── test_evaluate.py        # warn-don't-halt, unlabeled partitions
     └── test_*.py               # config, drift, inference, telemetry, ingest
 ```
 
@@ -475,7 +497,14 @@ This is the question most batch-scoring tutorials skip, and it is the one that b
   (lands ~daily, before this job runs)
 ```
 
-The pipeline's job is to **fail loudly** when the partition it was asked to score is missing or thin. That is what `MIN_ROW_COUNT` and the pre-flight check in `src/drift.py` are for. Exit code `2`, no predictions written, an alert fires. Silently scoring a half-loaded partition would be far worse.
+The pipeline's job is to **fail loudly** when the partition it was asked to score is missing. That is what `MIN_ROW_COUNT` and the pre-flight check in `src/drift.py` are for. Exit code `2`, no predictions written, an alert fires. Silently scoring a half-loaded partition would be far worse.
+
+> [!WARNING]
+> **The default `MIN_ROW_COUNT=1` is a presence check, not a volume floor.** It catches a partition that is entirely absent and nothing else; a partition at 10% of normal volume passes. That default exists because this repo cannot know your data. Once you do, raise it — the p50 row count per partition over the last 30 days, halved, is a reasonable starting point:
+>
+> ```bash
+> make tf-apply MIN_ROW_COUNT=50000
+> ```
 
 ### So why is there an ingestion phase in the code?
 
@@ -493,6 +522,12 @@ Deterministic, so re-running a given date always produces the same rows. Guarded
 
 > [!WARNING]
 > **Set `ENABLE_DEMO_INGESTION=false` in any real deployment.** A scoring pipeline that manufactures its own input data when the input is missing has replaced a loud failure with a silent lie. The only reason it is on by default here is that the alternative is a demo that breaks 24 hours after you deploy it.
+>
+> ```bash
+> make tf-apply ENABLE_DEMO_INGESTION=false
+> ```
+>
+> `make help` prints the current value, so you can confirm it before applying.
 
 With demo ingestion disabled, a missing partition behaves the way it should: the pre-flight check halts the run with exit code `2` and the Cloud Monitoring alert in `terraform/monitoring.tf` pages you.
 
@@ -500,29 +535,38 @@ With demo ingestion disabled, a missing partition behaves the way it should: the
 
 ## Configuration Reference
 
-All values are settable via environment variable or `.env`. Terraform supplies them in Cloud Run.
+All values are settable via environment variable or `.env` for local runs.
 
-| Variable | Default | Notes |
-| :--- | :--- | :--- |
-| `GCP_PROJECT_ID` | — | **Required.** |
-| `GCP_REGION` | `us-central1` | Cloud Run execution region. |
-| `BQ_LOCATION` | `US` | **Leave as `US`.** See the warning above. |
-| `BQ_DATASET_ID` | `ml_production` | |
-| `MODEL_NAME` | `taxi_tip_model` | Also the serving pointer for champion/challenger. |
-| `TARGET_DATE` | *(yesterday UTC)* | Set explicitly to backfill a specific partition. |
-| `BASELINE_START_DATE` | `2022-01-01` | PSI reference window start. |
-| `BASELINE_END_DATE` | `2022-01-15` | PSI reference window end. |
-| `EVAL_LABEL_LAG_DAYS` | `0` | Days for labels to mature. Raise for churn/fraud/credit. |
-| `PSI_DRIFT_THRESHOLD` | `0.25` | `<0.10` none, `0.10–0.25` moderate, `>0.25` significant. |
-| `CANARY_FEATURE` | `fare_amount` | Numeric feature monitored for drift. |
-| `MIN_HOLDOUT_ROC_AUC` | `0.60` | Below this, a warning is emitted (not a halt). |
-| `MIN_ROW_COUNT` | `1` | Volume floor for the target partition. |
-| `DEMO_SOURCE_TABLE` | `...tlc_yellow_trips_2022` | Public source table. One per year; **2011–2022 populated, 2023 is empty**. Year must match `DEMO_SOURCE_WINDOW_START`. |
-| `ENABLE_DEMO_INGESTION` | `true` | **Set `false` in production.** Synthesizes the target partition when absent. See above. |
-| `DEMO_SOURCE_WINDOW_START` | `2022-02-01` | First day of the window Phase 0 cycles through. Ignored when demo ingestion is off. |
-| `DEMO_SOURCE_WINDOW_DAYS` | `28` | Length of that window. The target date maps onto it modulo this. |
-| `METRIC_EXPORT_INTERVAL_MILLIS` | `60000` | **Must be ≥ 10000.** See the note below. |
-| `ENABLE_CLOUD_EXPORTERS` | `true` | `false` prints telemetry to stdout instead. |
+The **Deploy** column is the part worth reading. ✅ means Terraform passes it to the Cloud Run Job and you can override it on the `make` command line; ⬜ means it is deliberately *not* a deploy-time knob, for the reason given. That distinction is enforced by [`tests/test_terraform_contract.py`](tests/test_terraform_contract.py), which fails if a new setting is added to `PipelineConfig` without someone deciding which it is.
+
+| Variable | Default | Deploy | Notes |
+| :--- | :--- | :---: | :--- |
+| `GCP_PROJECT_ID` | — | ✅ | **Required.** |
+| `GCP_REGION` | `us-central1` | ✅ | Cloud Run execution region. |
+| `BQ_LOCATION` | `US` | ✅ | **Leave as `US`.** See the warning above. |
+| `BQ_DATASET_ID` | `ml_production` | ✅ | |
+| `MODEL_NAME` | `taxi_tip_model` | ✅ | Also the serving pointer for champion/challenger. |
+| `PSI_DRIFT_THRESHOLD` | `0.25` | ✅ | `<0.10` none, `0.10–0.25` moderate, `>0.25` significant. |
+| `MIN_ROW_COUNT` | `1` | ✅ | **A presence check at the default.** Raise it to catch partial loads. |
+| `ENABLE_DEMO_INGESTION` | `true` | ✅ | **Set `false` in production.** Synthesizes the target partition when absent. |
+| `DEMO_SOURCE_TABLE` | `...tlc_yellow_trips_2022` | ✅ | Public source table. One per year; **2011–2022 populated, 2023 is empty**. Year must match `DEMO_SOURCE_WINDOW_START`. |
+| `DEMO_SOURCE_WINDOW_START` | `2022-02-01` | ✅ | First day of the window Phase 0 cycles through. Change it *with* the table above — the container validates the two agree and refuses to start otherwise. |
+| `DEMO_SOURCE_WINDOW_DAYS` | `28` | ✅ | Length of that window. 28 rather than 30 so the rotation preserves day-of-week alignment. |
+| `TARGET_DATE` | *(yesterday UTC)* | ⬜ | Must resolve per-execution. Pinning it in the Job would freeze every scheduled run onto one date — backfill with `--update-env-vars` instead. |
+| `BASELINE_START_DATE` | `2022-01-01` | ⬜ | Must match the window the model was trained on, which `make seed` owns. |
+| `BASELINE_END_DATE` | `2022-01-15` | ⬜ | Paired with the above. |
+| `EVAL_LABEL_LAG_DAYS` | `0` | ⬜ | Domain property, not infrastructure. Raise in `config.py` for churn/fraud/credit. |
+| `CANARY_FEATURE` | `fare_amount` | ⬜ | Changing it requires the feature to exist in the view and be numeric — a code change with a test. |
+| `MIN_HOLDOUT_ROC_AUC` | `0.60` | ⬜ | Below this, a warning is emitted (not a halt). Belongs with the model, not the infra. |
+| `FEATURES_TABLE` / `FEATURE_VIEW` / `PREDICTIONS_TABLE` | *(see `config.py`)* | ⬜ | Created by `make seed`; the Job cannot be pointed elsewhere without re-seeding. |
+| `METRIC_EXPORT_INTERVAL_MILLIS` | `60000` | ⬜ | **Must be ≥ 10000.** A platform constraint, not a preference. See below. |
+| `ENABLE_CLOUD_EXPORTERS` | `true` | ⬜ | Must be true in Cloud Run; `false` is for local runs that print telemetry to stdout. |
+
+Deploy-time overrides all work the same way:
+
+```bash
+make tf-apply MIN_ROW_COUNT=50000 ENABLE_DEMO_INGESTION=false
+```
 
 > [!WARNING]
 > **Do not lower `METRIC_EXPORT_INTERVAL_MILLIS`.** Cloud Monitoring rejects two points written to the same time series within 5 seconds. A short interval collides with the shutdown force-flush, and the failure is a *logged export error*, not a crash — your job goes green with incomplete metrics. The config enforces a floor of 10,000 ms and a unit test pins it.
@@ -582,7 +626,7 @@ GROUP BY scoring_date ORDER BY scoring_date;
 
 ### Observability
 
-* **Cloud Trace** → root span `orchestrator.pipeline_run` with three child spans. Open `inference.execute_batch_predict` to see `bq.insert.slot_millis`, `bq.insert.rows_affected`, `bq.delete.job_id`.
+* **Cloud Trace** → root span `orchestrator.pipeline_run` with **four** child spans in the default demo configuration: `ingest.demo_partition`, `drift.check_and_calculate_psi`, `evaluate.labeled_production_check`, `inference.execute_batch_predict`. With `ENABLE_DEMO_INGESTION=false` the first one disappears and you see three. Open `inference.execute_batch_predict` to see `bq.insert.slot_millis`, `bq.insert.rows_affected`, `bq.delete.job_id`.
 * **Metrics Explorer** → `workload.googleapis.com/bqml.drift.feature_psi`, `bqml.evaluation.roc_auc`, `bqml.inference.slot_millis`.
 * **Logs Explorer** → `resource.type="cloud_run_job"`; every entry carries `logging.googleapis.com/trace`.
 

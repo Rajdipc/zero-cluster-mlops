@@ -65,8 +65,23 @@ resource "google_cloud_run_v2_job" "inference_job" {
           name  = "PSI_DRIFT_THRESHOLD"
           value = tostring(var.psi_drift_threshold)
         }
+        env {
+          name  = "MIN_ROW_COUNT"
+          value = tostring(var.min_row_count)
+        }
+
         # DEMO SCAFFOLDING. Set var.enable_demo_ingestion = false for real
         # deployments, where upstream ETL owns populating the feature table.
+        #
+        # All three demo variables are passed together on purpose. The container
+        # validates that DEMO_SOURCE_TABLE's year matches DEMO_SOURCE_WINDOW_START's
+        # year and refuses to start on a mismatch. Passing the table without the
+        # window means the operator can trip that validator and has no way to
+        # satisfy it -- the error message would name a variable that does not
+        # exist in this configuration. tests/test_terraform_contract.py asserts
+        # that every PipelineConfig field is either wired here or explicitly
+        # recorded as a deliberate omission, so a new field cannot be added to
+        # the container without someone deciding which it is.
         env {
           name  = "ENABLE_DEMO_INGESTION"
           value = tostring(var.enable_demo_ingestion)
@@ -74,6 +89,14 @@ resource "google_cloud_run_v2_job" "inference_job" {
         env {
           name  = "DEMO_SOURCE_TABLE"
           value = var.demo_source_table
+        }
+        env {
+          name  = "DEMO_SOURCE_WINDOW_START"
+          value = var.demo_source_window_start
+        }
+        env {
+          name  = "DEMO_SOURCE_WINDOW_DAYS"
+          value = tostring(var.demo_source_window_days)
         }
       }
     }
