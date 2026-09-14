@@ -228,7 +228,7 @@ make install
 make test
 ```
 
-Expect **43 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
+Expect **47 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
 
 ### Step 5 — Seed BigQuery and train  ⚠️ *first step that costs money*
 
@@ -407,9 +407,10 @@ zero-cluster-mlops/
 │   ├── seed_and_train.sh       # Idempotent: creates objects, loads data, trains
 │   └── run_local.sh            # Local orchestrator execution
 │
-└── tests/                      # 43 tests, no cloud access required
+└── tests/                      # 47 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
+    ├── test_docs_contract.py   # stops README SQL drifting from the real view
     └── test_*.py               # config, drift, inference, telemetry, ingest
 ```
 

@@ -37,6 +37,14 @@ ENV/
 crash.log
 *.tfvars
 !terraform.tfvars.example
+# Normally you SHOULD commit this. It is excluded here because a lock file
+# generated on one OS records hashes for that platform only, and readers
+# cloning this blueprint onto a different OS hit "provider does not have a
+# package for <platform> in the lock file". The provider is already pinned by
+# the `~> 5.0` constraint in terraform/versions.tf. If you fork this for a
+# single-platform team, commit it -- run:
+#   terraform providers lock -platform=linux_amd64 -platform=darwin_arm64
+.terraform.lock.hcl
 override.tf
 override.tf.json
 *_override.tf
