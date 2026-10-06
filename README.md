@@ -310,7 +310,7 @@ Thirteen resources in total, ~2 minutes. This first apply creates eleven of them
 | `google_monitoring_notification_channel` | email → `$NOTIFICATION_EMAIL` |
 | `google_monitoring_alert_policy` ×2 | PSI drift > 0.25, slot-millis > 300000 |
 
-**Then check your inbox.** Cloud Monitoring sends a verification email for the notification channel, and **alerts do not deliver until you click it.**
+**Then check the notification channel.** In the reference deployment the email channel worked straight away: the API reports no `verificationStatus` for it, meaning verification does not apply. If the console ever marks the channel **Unverified**, open *Monitoring → Alerting → Edit notification channels* and send a verification code, because an unverified channel delivers nothing.
 
 > [!IMPORTANT]
 > **Terraform state is local.** There is no `backend` block in `terraform/versions.tf`, so `terraform.tfstate` lands in `terraform/` inside your Cloud Shell home directory. Home persists between sessions but **Cloud Shell deletes it after 120 days of inactivity**. Lose the state and Terraform no longer knows these thirteen resources exist — you would delete them by hand or `terraform import` each one.
