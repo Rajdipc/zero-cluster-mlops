@@ -16,7 +16,7 @@ This is a complete, deployed blueprint for nightly batch scoring on Google Cloud
 
 **How to read it:**
 
-* **Business and product leaders:** [The Problem](#the-problem), [Should You Do This At All?](#should-you-do-this-at-all), [What It Actually Costs](#what-it-actually-costs), and the [Conclusion](#conclusion) (about 6 minutes).
+* **Business and product leaders:** [The Problem](#the-problem), [Should You Do This At All?](#should-you-do-this-at-all), and the [Conclusion](#conclusion) (about 5 minutes).
 * **Cloud and ML architects:** add the two data bugs ([Target Leakage](#the-bug-we-caught-target-leakage) and [The Unrecorded Label](#the-second-bug-a-label-that-was-never-recorded)), [The Architecture in Detail](#the-architecture-in-detail), [Where Does the Data Come From?](#where-does-the-data-come-from), [Scaling Up: BigQuery Slot Reservations](#scaling-up-bigquery-slot-reservations), and [Known Limitations](#known-limitations--natural-extensions) (about 20 minutes).
 * **Engineers implementing it:** read straight through. The [Deep Dives](#deep-dive-1-in-warehouse-push-down-inference), [Production Gotchas](#production-gotchas), and the [Console Verification Tour](#console-verification-tour) are written for you.
 * **New to Google Cloud or MLOps:** start with [The Problem](#the-problem) and [The Shape of It](#the-shape-of-it). Every concept is defined the first time it appears.
@@ -107,35 +107,6 @@ Adding an ephemeral Cloud Run container is justified only when you need three ca
 | Single distributed trace across phases | ✅ | ❌ | ⚠️ Partial |
 | Arbitrary Python feature libraries | ❌ | ❌ | ✅ |
 | Real-time online serving (< 50 ms) | ❌ | ❌ | ✅ |
-
----
-
-## What It Actually Costs
-
-When people pitch serverless ML, they sometimes compare costs against an always-on multi-node Dataproc cluster. That is an easy win on a slide, but modern teams rarely leave a cluster idling 24/7 for a job that runs for under a minute a day. The fairer comparison is against Google Cloud's other scale-to-zero batch options: **Dataproc Serverless** and **Vertex AI Batch Prediction**.
-
-| Dimension | Dataproc Serverless | Vertex AI Batch Prediction | **BQML + Cloud Run Job** |
-| :--- | :--- | :--- | :--- |
-| **Idle cost** | $0.00 | $0.00 | **$0.00** |
-| **Per-run cost (~70k rows)** | ~$0.01–0.05 (1-min billing minimum) | ~$0.01–0.05 (worker node minimum) | **Effectively $0.00** (covered by 1 TiB/mo free query tier) |
-| **Data movement** | Reads via Storage API into executor RAM | Exports to Cloud Storage, scores, writes back | **None** (evaluates weights against storage blocks in place) |
-| **Runtime to maintain** | Python env, Spark packages, executor tuning | Container image, model artifact server | **None** (model lives inside the dataset) |
-| **Cold start time** | 60–90 seconds | 3–5 minutes | **~30 seconds typical** (measured; occasionally 2–3 min when task scheduling is slow) |
-| **Framework flexibility** | Any Python / JVM framework | Any framework | **BQML-supported models & SQL features** |
-
-*The Dataproc Serverless and Vertex AI figures are typical estimates for a job of this size, not benchmarks we ran. The BQML + Cloud Run column comes from the reference deployment.*
-
-> 💡 **The real savings are operational, not the compute pennies:**  
-> At tutorial scale, all three options cost pennies per month. You do not choose in-warehouse inference to shave $2 off a compute bill. You choose it for the two rows in the middle of the table: **zero data movement and zero model runtime to patch.** You trade arbitrary Python flexibility in exchange for eliminating training/serving library mismatches, executor out-of-memory errors on skewed partitions, and Storage API quota bottlenecks.
-
-For this demo workload, every piece fits inside a free tier: BigQuery's first TiB scanned each month, well under a minute of Cloud Run vCPU time per night, and Cloud Scheduler's three free jobs per billing account. The bill is **$0.00 a month**, and it scales to single-digit dollars a month across tens of millions of daily rows.
-
-### What this changes for engineering and business teams
-
-* **No infrastructure pager rotation.** There are no node pools to upgrade, no persistent disks to fill up, and no cluster autoscalers to tune. When an alert fires, it points to a data quality issue rather than infrastructure plumbing.
-* **Faster path from prototype to production.** Because the model is trained and served with SQL, data scientists and analytics engineers can take a model from exploration to a scheduled job in days rather than waiting weeks for platform capacity.
-* **Lower marginal cost per additional model.** When every new model requires its own serving container and cluster sizing, teams ration how many models they deploy. When idle cost is zero and compute runs in shared warehouse slots, deploying five segment-specific models is nearly as simple as deploying one.
-* **Standard skills.** The entire stack relies on SQL, Python, and Terraform rather than specialized Spark tuning or Kubernetes operators.
 
 ---
 
@@ -588,7 +559,7 @@ def resolved_eval_date(self) -> str:
 
 ## Production Gotchas
 
-Here are seven pitfalls we hit while building, auditing, and deploying this pipeline. Most of them looked perfectly fine in code review.
+Here are six pitfalls we hit while building, auditing, and deploying this pipeline. Most of them looked perfectly fine in code review.
 
 ### 1. The Wall-Clock Partition Key Trap
 
@@ -690,18 +661,6 @@ resource "google_bigquery_dataset_iam_member" "runner_dataset_editor" {
 
 > 📂 *Complete Terraform modules for Cloud Run, Cloud Scheduler, IAM, and Cloud Monitoring alerts are in [`/terraform`](https://github.com/Rajdipc/zero-cluster-mlops/tree/main/terraform).*
 
-### 7. Bugs That Live Between Files
-
-Unit tests check Python and `terraform validate` checks HCL, but neither checks whether the environment variables your container expects match the ones Terraform passes. The bugs that cost us the most time lived in exactly that gap:
-
-* **A setting Terraform could not set.** `PipelineConfig` validates at startup that the year in `DEMO_SOURCE_TABLE` matches the year in `DEMO_SOURCE_WINDOW_START`, but `variables.tf` only exposed the first. Switching the demo year through Terraform crashed the job on a variable nobody could set. [`tests/test_terraform_contract.py`](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/tests/test_terraform_contract.py) now fails if a setting in `PipelineConfig` is neither wired into `cloud_run.tf` nor documented as an intentional omission.
-* **A fixed image tag that hid code changes.** With every build pushed as `worker:v1.0.0`, `make tf-apply` saw no change and left the job on the old image. The tag now comes from `git rev-parse --short HEAD`.
-* **The wrong project.** Terraform honoured `GCP_PROJECT_ID`, but bare `gcloud` calls in the Makefile used whatever `gcloud config` last pointed at. Every `gcloud` call now passes `--project` explicitly.
-* **Alerts on metrics that do not exist yet.** The alert policies watch custom metrics that the OpenTelemetry exporter creates on the job's first run, and Cloud Monitoring refuses a policy for a metric it has never seen. On a fresh project, the first `terraform apply` skips the alerts (`ENABLE_ALERT_POLICIES=false`), and a second apply adds them after the first execution.
-* **An aligner the metric kind does not allow.** `slot_millis` is an OpenTelemetry counter, which Cloud Monitoring stores as a `CUMULATIVE` metric, so the alert must use `ALIGN_DELTA` rather than `ALIGN_SUM`. The instrument kind is declared in Python and the aligner in HCL, so three contract tests now read both files and fail if they disagree.
-
-The last two only surfaced during the first real deploy into a clean project. The lesson is not that these were hard bugs. It is that a repository can pass a full test suite, `terraform validate`, and two rounds of review, and still fail in the first five minutes of a reader's first run. Budget one real deploy into a clean project before you publish anything others will copy.
-
 ---
 
 ## Deploy It Yourself
@@ -733,7 +692,7 @@ Here is what each step does:
 * **`make seed`** creates the `ml_production` dataset in the `US` multi-region, loads about 1.26 million public taxi rows, and trains the model (about 4 minutes, scanning about 1 GB, well inside the free tier).
 * **`make docker-push` and `make tf-apply`** build the container, create the two least-privilege service accounts, and provision the Cloud Run Job, the Cloud Scheduler trigger, and the alerts. `make deploy` runs both with a commit-pinned image tag. **No local Docker daemon?** `make deploy-cloudbuild` builds the same image on Cloud Build and then applies Terraform. The reference deployment for this post was built that way.
 * **`make execute`** runs the job once and waits for the result: `0` means success, `2` a guardrail halt, and `3` an unexpected, retryable failure.
-* **The second `make tf-apply`** adds the drift and cost alerts, which can only be created once the first run has produced their metrics (see [Gotcha #7](#7-bugs-that-live-between-files)). Then open *Monitoring → Alerting → Notification channels*: if your email channel is marked **Unverified**, verify it, because an unverified channel delivers nothing.
+* **The second `make tf-apply`** adds the drift and cost alerts, which can only be created once the first run has produced their metrics: Cloud Monitoring refuses an alert policy for a custom metric it has never seen. Then open *Monitoring → Alerting → Notification channels*: if your email channel is marked **Unverified**, verify it, because an unverified channel delivers nothing.
 
 You only need a `.env` file to run the orchestrator on your own machine with `make run-local` (`cp .env.example .env`). For deployment, the Makefile passes your exported variables straight to the seed script and Terraform.
 
@@ -887,71 +846,7 @@ Two things change that as a workload grows. The first is a deadline. If scored p
 * **Use `job_type = QUERY` for this pipeline.** `ML.PREDICT` and `ML.EVALUATE` on a logistic regression model run as ordinary query jobs, and so do the `DELETE` and `INSERT` around them. The `ML_EXTERNAL` job type is for BigQuery ML jobs that call services outside BigQuery, such as remote models on Vertex AI, and does not apply here.
 * **Idle capacity is shared.** A reservation that sets `ignore_idle_slots = false` can borrow slots that other reservations in the same administration project are not using. Scoring at 2 a.m., while the dashboards sleep, can run on more than its own pool.
 
-### Paying for baseline versus burst
-
-A reservation has two dials. The **baseline** (`slot_capacity`) is always on and always billed, whether a query is running or not. **Autoscaling** adds slots on top of the baseline when queries need them, up to `max_slots`, and bills them only while they are in use. A short nightly job usually wants a small baseline and a generous autoscaling ceiling. `max_slots` doubles as a cap on worst-case spend.
-
-In Terraform, an inference reservation and its assignment look like this:
-
-```hcl
-resource "google_bigquery_reservation" "inference" {
-  name     = "inference"
-  location = "US"
-  edition  = "ENTERPRISE"
-
-  # Baseline: always on, always billed.
-  slot_capacity = 100
-
-  # Borrow idle slots from other reservations.
-  ignore_idle_slots = false
-
-  # Burst on top of the baseline, billed only while in use.
-  autoscale {
-    max_slots = 100
-  }
-}
-
-resource "google_bigquery_reservation_assignment" "batch_scoring" {
-  # A project, folder, or organization.
-  assignee = "projects/ml-batch-prod"
-
-  # ML.PREDICT and ML.EVALUATE run as query jobs.
-  job_type    = "QUERY"
-  reservation = google_bigquery_reservation.inference.id
-}
-```
-
-*This is an example to adapt, not part of the repository. Apply it from the administration project.*
-
-### Sizing it from your own telemetry
-
-You do not have to guess the numbers. Every run already records `slot_millis` on its trace span and in Cloud Monitoring, and `INFORMATION_SCHEMA.JOBS_BY_PROJECT` keeps 180 days of history. Dividing a job's slot-milliseconds by its wall-clock milliseconds gives the average number of slots it used, so a job that consumed 600,000 slot-ms over 10 seconds averaged 60 slots. This query does that for every job the pipeline's service account ran in the last 30 days:
-
-```sql
--- How many slots does one scoring job really use? (last 30 days)
-SELECT
-  APPROX_QUANTILES(avg_slots, 100)[OFFSET(50)] AS p50_slots,
-  APPROX_QUANTILES(avg_slots, 100)[OFFSET(95)] AS p95_slots,
-  MAX(avg_slots)                               AS peak_slots
-FROM (
-  SELECT
-    SAFE_DIVIDE(
-      total_slot_ms,
-      TIMESTAMP_DIFF(end_time, start_time, MILLISECOND)
-    ) AS avg_slots
-  FROM `region-us`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-  WHERE creation_time >
-          TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-    AND job_type = 'QUERY'
-    AND state = 'DONE'
-    AND user_email LIKE 'sa-bqml-batch-runner@%'
-);
-```
-
-* **Size the baseline from the p95,** and let autoscaling absorb the occasional spike above it.
-* **Check the break-even before you switch.** Compare last month's on-demand bill with what the reservation would cost: baseline slots × hours in the month × your region's slot-hour price for the edition, plus the autoscaled slot-hours you expect. Prices vary by region and edition, so take them from the current BigQuery pricing page rather than from a blog post, this one included.
-
-On the reference deployment, this query returns a p95 of about 27 slots per job, a few seconds a night. On-demand wins comfortably at that size. Reservations start to pay off when nightly scoring reaches hundreds of gigabytes, when several teams share one warehouse, or when a missed morning deadline costs more than the slots.
+For a workload this size, on-demand is the right choice. Reservations start to pay off when nightly scoring reaches hundreds of gigabytes, when several teams share one warehouse, or when a missed morning deadline costs more than the slots.
 
 ---
 
