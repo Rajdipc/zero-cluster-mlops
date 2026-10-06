@@ -37,9 +37,10 @@ export NOTIFICATION_EMAIL="you@example.com"
 
 make install && make test   # ~1 min, no cloud access needed
 make seed                   # ~4 min, creates BQ objects + trains model
-make docker-push            # ~3 min
-make tf-apply               # ~2 min
-make execute                # ~30 s
+make docker-push            # ~3 min  (no Docker? make cloud-build-push)
+make tf-apply ENABLE_ALERT_POLICIES=false   # ~2 min, first apply only
+make execute                # ~1-2 min; first run also creates the custom metrics
+make tf-apply               # adds the two alert policies, now that the metrics exist
 ```
 
 Run `make help` at any time to see every target and your current settings.
@@ -47,17 +48,19 @@ Run `make help` at any time to see every target and your current settings.
 > 🚀 **Prefer a browser?** There is a complete, copy-paste [**Google Cloud Shell runbook**](#deploying-from-google-cloud-shell) below — no local Docker, Terraform, or Python install required.
 
 > [!CAUTION]
-> **Two ordering constraints that are not obvious, and both produce confusing errors.**
+> **Three ordering constraints that are not obvious, and all produce confusing errors.**
 >
 > 1. **Terraform does not enable any APIs.** There is deliberately no `google_project_service` resource in `terraform/` — provisioning a project's API surface is usually a platform-team concern, not an application concern. You must run the `gcloud services enable` block yourself.
 > 2. **`make seed` must run before `make tf-apply`.** Terraform's `google_bigquery_dataset_iam_member` grants `dataEditor` on the `ml_production` dataset, but the dataset is created by [`scripts/seed_and_train.sh`](scripts/seed_and_train.sh), not by Terraform. Apply first and you get `Error 404: Not found: Dataset <project>:ml_production`.
+>
+> 3. **The alert policies cannot be created until the job has run once.** They watch custom `workload.googleapis.com/bqml.*` metrics, which the OpenTelemetry exporter creates on the first execution. Before that, Cloud Monitoring rejects the policies with `Error 404: Cannot find metric(s) that match type`. Hence the first `tf-apply` passes `ENABLE_ALERT_POLICIES=false`, and the second one adds the alerts.
 >
 > The order in the TL;DR above is correct. Follow it on a first run.
 
 > [!IMPORTANT]
 > **Do you need to create a `.env` file? For deployment, no.**
 >
-> The five commands above run entirely on the exported shell variables. `make seed`
+> The commands above run entirely on the exported shell variables. `make seed`
 > is a bash script that reads them directly; `make tf-apply` passes them to Terraform
 > as `-var` flags; and the deployed container receives its settings as Cloud Run
 > environment variables set by Terraform — it never sees a `.env` file at all.
@@ -228,7 +231,7 @@ make install
 make test
 ```
 
-Expect **103 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
+Expect **106 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
 
 ### Step 5 — Seed BigQuery and train  ⚠️ *first step that costs money*
 
@@ -241,7 +244,7 @@ Four things happen, in order:
 1. **Creates the `ml_production` dataset** in location `US`, idempotently. *This is why seed must precede Terraform.*
 2. Runs `sql/create_tables.sql` — feature table, the canonical `v_taxi_features` view, predictions table.
 3. Loads three windows from `bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022`:
-   * `2022-01-01` → `2022-01-15` — training **and** PSI baseline (~1.14 M rows)
+   * `2022-01-01` → `2022-01-15` — training **and** PSI baseline (~1.07 M rows after quality filters; ~830 K card trips reach the model)
    * source date `2022-02-01`, **remapped to yesterday** so the first scheduled run has something to score
    * `2022-02-10` — the backfill test partition (~105 K rows)
 4. Runs `sql/train_model.sql` — logistic regression with a chronological `SEQ` split.
@@ -291,10 +294,10 @@ This is how the reference deployment was built: the workstation it ran on had no
 
 ```bash
 make tf-plan     # optional on a first run, but worth reading
-make tf-apply
+make tf-apply ENABLE_ALERT_POLICIES=false
 ```
 
-Eleven resources, ~2 minutes:
+Thirteen resources in total, ~2 minutes. This first apply creates eleven of them; the two alert policies follow in Step 8, because their metrics do not exist until the job has run once:
 
 | Resource | Detail |
 | :--- | :--- |
@@ -310,7 +313,7 @@ Eleven resources, ~2 minutes:
 **Then check your inbox.** Cloud Monitoring sends a verification email for the notification channel, and **alerts do not deliver until you click it.**
 
 > [!IMPORTANT]
-> **Terraform state is local.** There is no `backend` block in `terraform/versions.tf`, so `terraform.tfstate` lands in `terraform/` inside your Cloud Shell home directory. Home persists between sessions but **Cloud Shell deletes it after 120 days of inactivity**. Lose the state and Terraform no longer knows these eleven resources exist — you would delete them by hand or `terraform import` each one.
+> **Terraform state is local.** There is no `backend` block in `terraform/versions.tf`, so `terraform.tfstate` lands in `terraform/` inside your Cloud Shell home directory. Home persists between sessions but **Cloud Shell deletes it after 120 days of inactivity**. Lose the state and Terraform no longer knows these thirteen resources exist — you would delete them by hand or `terraform import` each one.
 >
 > For anything beyond a demo, add a remote backend:
 >
@@ -324,11 +327,14 @@ Eleven resources, ~2 minutes:
 > }
 > ```
 
-### Step 8 — Run it once
+### Step 8 — Run it once, then add the alerts
 
 ```bash
-make execute     # ~25 seconds
+make execute     # ~25 s of container time, ~1 min end to end
+make tf-apply    # adds the two alert policies now that their metrics exist
 ```
+
+The first execution is what creates the custom `workload.googleapis.com/bqml.*` metrics, so only now can Cloud Monitoring accept alert policies on them. If the second apply still reports `Cannot find metric(s)`, wait a few minutes and re-run it: new metric descriptors can take up to ten minutes to propagate.
 
 Read the exit code — see [Exit Codes](#exit-codes). A first run exiting `2` almost always means the "yesterday" partition never landed; go back and re-read the Step 5 partition summary.
 
@@ -358,7 +364,12 @@ These are in addition to the [main troubleshooting table](#troubleshooting):
 | Symptom | Cause | Fix |
 | :--- | :--- | :--- |
 | `Error 404: Not found: Dataset ...:ml_production` during apply | Terraform ran before `make seed` | Run `make seed`, then re-apply |
-| `Cannot connect to the Docker daemon` | Cloud Shell VM was recycled | Use the Cloud Build fallback in Step 6 |
+| `Error 404: Cannot find metric(s) that match type = "workload.googleapis.com/bqml..."` | Alert policies applied before the job ever ran | `make tf-apply ENABLE_ALERT_POLICIES=false`, `make execute`, then `make tf-apply` |
+| `Error 400: ... "ALIGN_SUM": The aligner cannot be applied to metrics with kind CUMULATIVE` | Checkout predates the aligner fix | Pull latest; the slot alert now uses `ALIGN_DELTA` |
+| `FATAL Flags parsing error: Unknown command line flag ' '` during `make seed` | Checkout predates the stdin fix; `bq` read the SQL's `--` banner as a flag | Pull latest |
+| `Syntax error: Unexpected keyword ROWS` | `ROWS` is reserved in GoogleSQL | Alias the count as `row_count` |
+| Job or repo created in the wrong project | `gcloud config` project differs from `GCP_PROJECT_ID` | Pull latest (every Makefile `gcloud` call now passes `--project`), or `gcloud config set project "$GCP_PROJECT_ID"` |
+| `Cannot connect to the Docker daemon` | Cloud Shell VM was recycled | `make deploy-cloudbuild` (see Step 6) |
 | `The project does not contain an App Engine application` | Older project without regional Cloud Scheduler | `gcloud app create --region=us-central`, then re-apply |
 | Variables unset after reconnecting | Session expired | Put the exports in `~/.bashrc` |
 | `no space left on device` during build | Cloud Shell disk filled with layers | `docker system prune -af`, or switch to Cloud Build |
@@ -421,7 +432,7 @@ zero-cluster-mlops/
 │   ├── seed_and_train.sh       # Idempotent: creates objects, loads data, trains
 │   └── run_local.sh            # Local orchestrator execution
 │
-└── tests/                      # 103 tests, no cloud access required
+└── tests/                      # 106 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
     ├── test_terraform_contract.py # Terraform <-> container config seam

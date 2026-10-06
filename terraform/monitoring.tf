@@ -87,8 +87,14 @@ resource "google_monitoring_alert_policy" "high_slot_usage" {
       duration        = "0s"
 
       aggregations {
-        alignment_period     = "300s"
-        per_series_aligner   = "ALIGN_SUM"
+        alignment_period = "300s"
+        # ALIGN_DELTA, not ALIGN_SUM. slot_millis is an OpenTelemetry Counter,
+        # which Cloud Monitoring stores as CUMULATIVE INT64, and the API rejects
+        # ALIGN_SUM on that kind with HTTP 400. ALIGN_DELTA turns the running
+        # total into "slot-ms consumed in this window". The 404 on the missing
+        # metric hid this on the first deploy; tests/test_terraform_contract.py
+        # now checks every aligner against the instrument kind in telemetry.py.
+        per_series_aligner   = "ALIGN_DELTA"
         cross_series_reducer = "REDUCE_SUM"
         group_by_fields      = ["metric.label.model_name"]
       }

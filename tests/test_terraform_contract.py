@@ -270,3 +270,81 @@ def test_terraform_targets_share_one_variable_list(target):
         f"{target} hand-rolls its own -var list instead of reusing TF_VARS. "
         f"Three copies of one list is how they drift apart."
     )
+
+
+# ==============================================================================
+# Alert policies <-> OpenTelemetry instruments
+#
+# Found on the first real deploy. The slot-usage alert used ALIGN_SUM on
+# bqml.inference.slot_millis, which telemetry.py creates as a Counter. Cloud
+# Monitoring stores OTel counters as CUMULATIVE, and rejects ALIGN_SUM on a
+# CUMULATIVE metric with HTTP 400 -- at apply time, never before. Neither
+# `terraform validate` nor any Python test could see it, because the instrument
+# kind lives in one language and the aligner in another.
+# ==============================================================================
+TELEMETRY_PY = Path(__file__).resolve().parent.parent / "src" / "telemetry.py"
+SRC_DIR = TELEMETRY_PY.parent
+
+# Aligners Cloud Monitoring accepts per metric kind (subset this repo can use).
+# CUMULATIVE: only delta/rate-style aligners. GAUGE: anything except those.
+_CUMULATIVE_ALIGNERS = {"ALIGN_DELTA", "ALIGN_RATE"}
+_GAUGE_FORBIDDEN_ALIGNERS = {"ALIGN_DELTA", "ALIGN_RATE"}
+
+
+def _instrument_kinds() -> dict:
+    """Maps OTel metric name -> 'counter' | 'gauge', read from telemetry.py."""
+    source = TELEMETRY_PY.read_text(encoding="utf-8")
+    pairs = re.findall(r'create_(counter|gauge)\(\s*name\s*=\s*"([^"]+)"', source)
+    assert pairs, "found no metric instruments in telemetry.py; has the API changed?"
+    return {name: kind for kind, name in pairs}
+
+
+def _alert_conditions() -> list:
+    """(metric, aligner, group_by_labels) for every threshold condition."""
+    hcl = _strip_hcl_comments((TERRAFORM_DIR / "monitoring.tf").read_text(encoding="utf-8"))
+    conditions = []
+    for block in re.split(r"condition_threshold\s*\{", hcl)[1:]:
+        metric = re.search(r'metric\.type=\\"workload\.googleapis\.com/([^\\"]+)\\"', block)
+        aligner = re.search(r'per_series_aligner\s*=\s*"([A-Z_]+)"', block)
+        group_by = re.search(r"group_by_fields\s*=\s*\[([^\]]*)\]", block)
+        assert metric and aligner, "an alert condition is missing its metric filter or aligner"
+        labels = re.findall(r'"metric\.label\.([a-z_]+)"', group_by.group(1)) if group_by else []
+        conditions.append((metric.group(1), aligner.group(1), labels))
+    assert conditions, "found no alert conditions in monitoring.tf"
+    return conditions
+
+
+def test_every_alerted_metric_is_actually_emitted():
+    """An alert on a metric nobody writes never fires, and never errors either."""
+    kinds = _instrument_kinds()
+    for metric, _, _ in _alert_conditions():
+        assert metric in kinds, (
+            f"monitoring.tf alerts on {metric}, which telemetry.py never creates."
+        )
+
+
+def test_alert_aligners_match_instrument_kinds():
+    kinds = _instrument_kinds()
+    for metric, aligner, _ in _alert_conditions():
+        if kinds[metric] == "counter":
+            assert aligner in _CUMULATIVE_ALIGNERS, (
+                f"{metric} is an OTel Counter (CUMULATIVE in Cloud Monitoring) but "
+                f"its alert uses {aligner}. The API rejects that with HTTP 400 at "
+                f"apply time. Use one of {sorted(_CUMULATIVE_ALIGNERS)}."
+            )
+        else:
+            assert aligner not in _GAUGE_FORBIDDEN_ALIGNERS, (
+                f"{metric} is a Gauge but its alert uses {aligner}, which only "
+                f"applies to CUMULATIVE or DELTA metrics."
+            )
+
+
+def test_alert_group_by_labels_are_recorded_as_attributes():
+    """Grouping by a label the code never sets silently collapses every series."""
+    source = "\n".join(p.read_text(encoding="utf-8") for p in SRC_DIR.glob("*.py"))
+    for metric, _, labels in _alert_conditions():
+        for label in labels:
+            assert re.search(rf'"{label}"\s*:', source), (
+                f"alert on {metric} groups by metric.label.{label}, but no metric "
+                f"attribute named '{label}' is ever recorded in src/."
+            )
