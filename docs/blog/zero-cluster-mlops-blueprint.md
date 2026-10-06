@@ -378,50 +378,19 @@ def resolved_eval_date(self) -> str:
 
 ## Production Gotchas
 
-Here are six pitfalls we hit while building, auditing, and deploying this pipeline. Most of them looked perfectly fine in code review.
+Here are six pitfalls we hit while building, auditing, and deploying this pipeline. Most of them looked perfectly fine in code review. Each one is summarized below. The [production gotchas runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md) has the full write-up: the code, what the failure looks like, and the test that keeps it from coming back.
 
 ### 1. The Wall-Clock Partition Key Trap
 
-* **The pitfall:** Defining your predictions table with `CURRENT_TIMESTAMP() AS scored_at` and partitioning on `DATE(scored_at)` records *when the container ran* rather than *which day's data was scored*. The first time you backfill a historical date (say, `2022-02-10`), those rows land inside today's partition alongside today's scheduled run, corrupting downstream queries.
-* **The fix:** Partition explicitly on `scoring_date` (populated from the target-date parameter) and keep `scored_at` purely as an unpartitioned audit timestamp:
-
-```sql
-PARTITION BY scoring_date   -- the date whose data was scored
-CLUSTER BY vendor_id
-...
-  scoring_date DATE NOT NULL,   -- written from the target-date parameter
-  scored_at TIMESTAMP           -- audit only; never a partition key
-```
+Partitioning the predictions table on `DATE(scored_at)` records *when the container ran*, not *which day's data was scored*. The first backfill of an old date, say `2022-02-10`, lands inside today's partition and quietly corrupts every downstream query. **The fix:** partition on `scoring_date`, written from the target-date parameter, and keep `scored_at` as an audit column only.
 
 ### 2. The Idempotency vs. Telemetry Tradeoff
 
-* **The pitfall:** Plain `INSERT INTO ... SELECT` appends duplicate rows whenever a job is re-run. The natural SQL fix is to combine `DELETE` and `INSERT` in a single file:
-
-```sql
-DELETE FROM predictions WHERE scoring_date = @d;
-INSERT INTO predictions SELECT ... FROM ML.PREDICT(...);
-```
-
-However, sending two semicolon-separated statements in one API call causes BigQuery to execute a **multi-statement script job**. For script jobs, the parent `QueryJob` object returns `num_dml_affected_rows = None`, wiping out the row-count telemetry on your OpenTelemetry spans.
-
-* **The fix:** Execute `delete_partition.sql` and `batch_inference.sql` as **two separate single-statement `client.query()` calls**. Each job returns exact `slot_millis`, `total_bytes_billed`, and `num_dml_affected_rows`:
-
-```python
-delete_job = client.query(config.load_sql("delete_partition.sql"))
-delete_job.result()
-delete_stats = _record_job_telemetry(delete_job, config, "delete")
-
-insert_job = client.query(config.load_sql("batch_inference.sql"))
-insert_job.result()
-insert_stats = _record_job_telemetry(insert_job, config, "insert")
-```
-
-The same rule applies to DDL. Prefixing a runtime query with `CREATE TABLE IF NOT EXISTS ...;` also turns it into a script job, so all DDL runs once at setup (`make seed`), and tests check that the scoring and ingestion queries stay single-statement.
+Putting `DELETE` and `INSERT` in one SQL file is the natural way to make reruns safe. But two statements in one API call become a BigQuery **script job**, and script jobs report `num_dml_affected_rows = None`, so your trace spans lose their row counts. **The fix:** submit the two statements as separate single-statement jobs, and run all DDL once at setup instead of at the top of runtime queries.
 
 ### 3. Separating Terminal Guardrail Halts from Transient Retries
 
-* **The pitfall:** If Cloud Run is configured with `max_retries > 0` and your container exits with a generic non-zero code on drift, Cloud Run immediately spins up a retry container against the exact same bad partition, failing again and doubling alert noise. Conversely, setting `max_retries = 0` without distinguishing error types means a transient BigQuery 503 error leaves a 24-hour gap.
-* **The fix:** Use distinct exit codes so operators and orchestration tools can tell permanent data issues apart from infrastructure blips:
+With retries on, a drift halt simply reruns against the same bad partition and doubles the alert noise. With retries off and one generic error code, a transient BigQuery 503 costs you a day of scores. **The fix:** distinct exit codes, so operators and schedulers can tell bad data from flaky infrastructure:
 
 | Exit Code | Condition | Should Orchestration Retry? |
 | :--- | :--- | :--- |
@@ -431,54 +400,17 @@ The same rule applies to DDL. Prefixing a runtime query with `CREATE TABLE IF NO
 
 ### 4. Cloud Monitoring's 5-Second Write Limit on Short-Lived Jobs
 
-* **The pitfall:** Google Cloud Monitoring rejects two data points written to the same time series within **5 seconds** (`INVALID_ARGUMENT`). If `PeriodicExportingMetricReader` is configured with a short 5-second interval and your short job calls `meter_provider.shutdown()` at exit, the periodic background flush and the shutdown flush collide inside the 5-second window—dropping metrics with a non-fatal log warning while the job reports green.
-* **The fix:** Set `export_interval_millis = 60000` (longer than the job runtime so the shutdown flush is the sole export) and enable `add_unique_identifier=True`:
-
-```python
-# Extracted from: src/telemetry.py
-gcp_metric_exporter = CloudMonitoringMetricsExporter(
-    project_id=config.gcp_project_id,
-    add_unique_identifier=True,      # prevents collisions across retried runs
-)
-metric_reader = PeriodicExportingMetricReader(
-    gcp_metric_exporter,
-    export_interval_millis=60000,    # 60s >> the ~25s job duration
-)
-```
+Cloud Monitoring rejects two points on the same time series within **5 seconds**. With a short export interval, the periodic flush and the shutdown flush collide at exit, the metrics are dropped with only a non-fatal warning, and the job still reports green. **The fix:** set the export interval to 60 seconds, longer than the job itself, so the shutdown flush is the only export, and turn on `add_unique_identifier`.
 
 ### 5. `GCP_REGION` Is Not `BQ_LOCATION`
 
-* **The pitfall:** Setting both to `us-central1` feels natural. But `GCP_REGION` is where the container runs, and `BQ_LOCATION` is where the data lives. The public taxi data sits in the `US` multi-region and BigQuery cannot join tables across locations, so `BQ_LOCATION="us-central1"` makes the seed script fail immediately with a location mismatch error.
-* **The fix:** Keep two separate settings, `GCP_REGION="us-central1"` and `BQ_LOCATION="US"`. Terraform passes `BQ_LOCATION` to the container on its own and never derives it from the region.
+`GCP_REGION` is where the container runs; `BQ_LOCATION` is where the data lives. The public taxi data sits in the `US` multi-region and BigQuery cannot join across locations, so `BQ_LOCATION="us-central1"` fails the seed script immediately. **The fix:** keep two separate settings (`us-central1` and `US`). Terraform passes `BQ_LOCATION` on its own and never derives it from the region.
 
 ### 6. "Least Privilege" That Quietly Grants the Whole Project
 
-* **The pitfall:** Many reference templates claim least-privilege IAM while granting `roles/bigquery.dataEditor` at the **project** level, which lets the batch worker overwrite or delete any dataset in your Google Cloud project.
-* **The fix:** In [`terraform/iam.tf`](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/terraform/iam.tf), only job submission and telemetry writing are granted at project scope. Data modification is restricted to the `ml_production` dataset:
+Many reference templates claim least privilege while granting `roles/bigquery.dataEditor` at the **project** level, which lets the batch worker overwrite or delete any dataset in the project. **The fix:** [`terraform/iam.tf`](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/terraform/iam.tf) grants only job submission and telemetry writing at project scope, and confines data changes to the `ml_production` dataset.
 
-```hcl
-# terraform/iam.tf
-# bigquery.jobUser is project-scoped by definition: creating a query job is a
-# project-level operation with no dataset-level equivalent.
-locals {
-  runner_project_roles = [
-    "roles/bigquery.jobUser",
-    "roles/cloudtrace.agent",
-    "roles/monitoring.metricWriter",
-    "roles/logging.logWriter",
-  ]
-}
-
-# Data access confined to ONE dataset.
-resource "google_bigquery_dataset_iam_member" "runner_dataset_editor" {
-  project    = var.project_id
-  dataset_id = var.bq_dataset_id
-  role       = "roles/bigquery.dataEditor"
-  member     = "serviceAccount:${google_service_account.runner_sa.email}"
-}
-```
-
-> 📂 *Complete Terraform modules for Cloud Run, Cloud Scheduler, IAM, and Cloud Monitoring alerts are in [`/terraform`](https://github.com/Rajdipc/zero-cluster-mlops/tree/main/terraform).*
+> 📂 *The code for each fix, and a way to check it on your own deployment, is in the [production gotchas runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md). Complete Terraform modules for Cloud Run, Cloud Scheduler, IAM, and Cloud Monitoring alerts are in [`/terraform`](https://github.com/Rajdipc/zero-cluster-mlops/tree/main/terraform).*
 
 ---
 
@@ -716,6 +648,7 @@ What separates a quick demo from a dependable production pipeline is rarely the 
 ### Serverless Execution & Orchestration
 * [Overview of Cloud Run Jobs](https://cloud.google.com/run/docs/create-jobs)
 * [Cloud Run Jobs Execution Lifecycle & Task Retries](https://cloud.google.com/run/docs/execute/jobs)
+* [Production gotchas for this blueprint: failure modes, fixes, and the tests that guard them](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md)
 
 ### OpenTelemetry & Google Cloud Observability
 * [OpenTelemetry Python SDK](https://opentelemetry.io/docs/languages/python/)

@@ -23,6 +23,7 @@ Production-grade batch ML inference executed **inside** BigQuery, orchestrated b
 | [Verifying It Worked](#verifying-it-worked) | idempotency, circuit breaker, backfill |
 | [Exit Codes](#exit-codes) | `0` / `2` / `3` and when to retry |
 | [Troubleshooting](#troubleshooting) | symptom → cause → fix |
+| [**Production Gotchas**](docs/production-gotchas.md) *(separate page)* | six failure modes, the fix, the test, and a check for your deployment |
 | [Known Limitations](#known-limitations) | what this deliberately does not do |
 | [Cleanup](#cleanup) | tear it all down |
 
@@ -435,6 +436,7 @@ zero-cluster-mlops/
 │
 ├── docs/
 │   ├── data-notes.md           # Dataset, the two data bugs, Phase 0 in full
+│   ├── production-gotchas.md   # Six failure modes: fix, test, how to check
 │   ├── blog/                   # Companion article (Markdown)
 │   └── images/                 # Rendered diagrams and data tables
 │
@@ -643,6 +645,8 @@ GROUP BY scoring_date ORDER BY scoring_date;
 
 Terraform ships `max_retries = 0`. Because Phase 3 clears the partition before repopulating it, raising this to `1` is safe if you prefer resilience to transient errors.
 
+Why the codes are split this way, and a one-line check of the retry setting on your deployment, are in [Production Gotchas § 3](docs/production-gotchas.md#3-separating-terminal-guardrail-halts-from-transient-retries).
+
 ---
 
 ## Troubleshooting
@@ -663,6 +667,8 @@ Terraform ships `max_retries = 0`. Because Phase 3 clears the partition before r
 | `Demo ingestion misconfigured: DEMO_SOURCE_TABLE points at year ...` | Source table year and window year disagree | Set both to the same year. This is a startup guard, not a runtime failure — it is doing its job |
 | Seeded successfully but every partition is empty | Pointed at `tlc_yellow_trips_2023`, which **exists but has 0 rows** | Use 2011–2022. Only those are populated |
 | Predictions in today's partition after a backfill | Partitioned on `scored_at` | Partition on `scoring_date` |
+
+Several of these rows (location, metric interval, script jobs, backfill partition) are written up in full, with the code and a check you can run, in [Production Gotchas](docs/production-gotchas.md).
 
 ---
 
