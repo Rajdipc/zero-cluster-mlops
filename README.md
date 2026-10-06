@@ -18,6 +18,7 @@ Production-grade batch ML inference executed **inside** BigQuery, orchestrated b
 | [Repository Structure](#repository-structure) | what every file does |
 | [Data Model](#data-model) | partitioning, the canonical view, label validity |
 | [Where Does the Data Come From?](#where-does-the-data-come-from) | the ETL boundary, and why Phase 0 exists |
+| [**Data Notes**](docs/data-notes.md) *(separate page)* | the dataset, the two data bugs, and Phase 0 in full |
 | [Configuration Reference](#configuration-reference) | every environment variable |
 | [Verifying It Worked](#verifying-it-worked) | idempotency, circuit breaker, backfill |
 | [Exit Codes](#exit-codes) | `0` / `2` / `3` and when to retry |
@@ -432,6 +433,11 @@ zero-cluster-mlops/
 │   ├── seed_and_train.sh       # Idempotent: creates objects, loads data, trains
 │   └── run_local.sh            # Local orchestrator execution
 │
+├── docs/
+│   ├── data-notes.md           # Dataset, the two data bugs, Phase 0 in full
+│   ├── blog/                   # Companion article (Markdown)
+│   └── images/                 # Rendered diagrams and data tables
+│
 └── tests/                      # 106 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
@@ -472,18 +478,16 @@ Three deliberate choices:
 
 ### Two label-validity decisions the schema does not show
 
-Both were found by profiling the public dataset before trusting it, and both change what the model actually means.
+Both came from profiling the public dataset before trusting it, and both change what the model means:
 
-**Cash trips are excluded (`payment_type = '1'`).** NYC TLC records `tip_amount` only for card payments; cash tips are always written as `0.00`, because the meter never saw them. That is **22% of the January 2022 window**, every row labelled `is_high_tip = 0` regardless of how long or expensive the trip was. Training on them teaches the model that a fifth of ordinary trips produce no tip, with nothing in the feature set able to explain why. Excluding them raises `corr(trip_distance, label)` from **0.19 to 0.258**.
-
-The honest statement of the task is therefore: *given a card payment, will the tip exceed \$2.00?*
-
-**`total_amount` is filtered on but never learned from.** It contains `tip_amount`, and the label is derived from `tip_amount` — so using it as a feature leaks the target. It survives in the table (useful for the surrogate key and for quality filtering) but is absent from the view's projection. A model that "predicts" tips at 0.99 ROC-AUC is usually doing this.
-
-> [!NOTE]
-> **`auto_class_weights` is deliberately off.** The card-only window is **61.7%** positive — near-balanced. Weighting would distort the decision boundary to fix an imbalance that does not exist, and would cost calibrated probabilities, which the motivating use case multiplies by money.
+- **Cash trips are excluded (`payment_type = '1'`).** TLC records tips only for card payments, so every cash trip (22% of the January 2022 window) carries `tip_amount = 0.00`. The task is therefore *given a card payment, will the tip exceed \$2.00?*
+- **`total_amount` is filtered on but never learned from.** It already contains the tip, so using it as a feature leaks the label. In our measurement the leak lifted holdout ROC-AUC from **0.77 to 0.81**, which is small enough to pass a review.
 
 Both decisions are enforced by [`tests/test_feature_contract.py`](tests/test_feature_contract.py), which parses the SQL and fails if a filter references a column no write path populates — the bug that silently empties the view.
+
+A related choice: `auto_class_weights` is off, because the card-only window is 61.7% positive and close to balanced.
+
+> **The full story, with the profiling queries, the measured numbers and the checks you can reuse on your own data, is in [Data Notes](docs/data-notes.md).**
 
 ---
 
@@ -515,17 +519,7 @@ The pipeline's job is to **fail loudly** when the partition it was asked to scor
 
 ### So why is there an ingestion phase in the code?
 
-Because this demo reads `bigquery-public-data`, which is **frozen in 2022**. Nothing will ever land a partition for yesterday.
-
-`make seed` loads a fixed historical window and remaps one day of it onto `CURRENT_DATE() - 1` so that the first scheduled run has something to score. But that remap happens **once, at seed time**. Tomorrow's run looks for tomorrow's partition, finds nothing, and halts with `InsufficientDataException`. The demo would appear to work perfectly and then die overnight — exactly the kind of thing that makes a blueprint untrustworthy.
-
-**Phase 0 (`src/ingest.py` + `sql/ingest_demo_partition.sql`) exists solely to close that gap.** When the target partition is absent, it synthesizes one by mapping the target date onto a rotating 28-day historical window:
-
-```sql
-MOD(DATE_DIFF(target_date, DATE '1970-01-01', DAY), 28)
-```
-
-Deterministic, so re-running a given date always produces the same rows. Guarded by `WHERE NOT EXISTS`, so it never double-loads and never overwrites a partition your real ETL already landed.
+This demo reads `bigquery-public-data`, which is **frozen in 2022**, so nothing will ever land a partition for yesterday. Without help, the demo would work on day one and halt with `InsufficientDataException` on day two. **Phase 0** (`src/ingest.py` + `sql/ingest_demo_partition.sql`) closes that gap: when the target partition is absent, it synthesizes one deterministically from a rotating 28-day historical window, and a `NOT EXISTS` guard stops it from ever overwriting a partition your real ETL landed. The mechanism is explained in full in [Data Notes § 6](docs/data-notes.md#6-phase-0-keeping-the-demo-alive-past-day-one).
 
 > [!WARNING]
 > **Set `ENABLE_DEMO_INGESTION=false` in any real deployment.** A scoring pipeline that manufactures its own input data when the input is missing has replaced a loud failure with a silent lie. The only reason it is on by default here is that the alternative is a demo that breaks 24 hours after you deploy it.

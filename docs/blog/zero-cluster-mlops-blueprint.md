@@ -9,7 +9,7 @@
 This is a complete, deployed blueprint for nightly batch scoring on Google Cloud. BigQuery ML does the math where the data already lives, a short-lived Cloud Run Job enforces the guardrails around it, and OpenTelemetry records one distributed trace for every run. Everything is provisioned with Terraform, and the code is on GitHub.
 
 * **About ten seconds of pipeline work per night** to score 68,891 trips, **$0.00 when idle**, and no cluster to patch.
-* **A target leak lifted ROC-AUC from 0.77 to 0.81**, small enough to pass review. We show the arithmetic and the check that catches it.
+* **A target leak lifted ROC-AUC from 0.77 to 0.81**, small enough to pass review. We show the check that catches it.
 * **Cash trips are 100.0% zero-tip**, because the meter never sees a cash tip. Filtering them out recovered more than a third of the signal.
 * **Closed PSI bins let 30% out-of-range data pass** the drift check. Open outer bins halt it.
 * **106 offline tests run in about a second**, including contract tests that keep Terraform and Python in agreement.
@@ -17,7 +17,7 @@ This is a complete, deployed blueprint for nightly batch scoring on Google Cloud
 **How to read it:**
 
 * **Business and product leaders:** [The Problem](#the-problem), [Should You Do This At All?](#should-you-do-this-at-all), and the [Conclusion](#conclusion) (about 5 minutes).
-* **Cloud and ML architects:** add the two data bugs ([Target Leakage](#the-bug-we-caught-target-leakage) and [The Unrecorded Label](#the-second-bug-a-label-that-was-never-recorded)), [The Architecture in Detail](#the-architecture-in-detail), [Where Does the Data Come From?](#where-does-the-data-come-from), [Scaling Up: BigQuery Slot Reservations](#scaling-up-bigquery-slot-reservations), and [Known Limitations](#known-limitations--natural-extensions) (about 20 minutes).
+* **Cloud and ML architects:** add [the data and its two bugs](#the-data-and-two-bugs-it-taught-us), [The Architecture in Detail](#the-architecture-in-detail), [Where Does the Data Come From?](#where-does-the-data-come-from), [Scaling Up: BigQuery Slot Reservations](#scaling-up-bigquery-slot-reservations), and [Known Limitations](#known-limitations--natural-extensions) (about 20 minutes).
 * **Engineers implementing it:** read straight through. The [Deep Dives](#deep-dive-1-in-warehouse-push-down-inference), [Production Gotchas](#production-gotchas), and the [Console Verification Tour](#console-verification-tour) are written for you.
 * **New to Google Cloud or MLOps:** start with [The Problem](#the-problem) and [The Shape of It](#the-shape-of-it). Every concept is defined the first time it appears.
 
@@ -110,198 +110,33 @@ Adding an ephemeral Cloud Run container is justified only when you need three ca
 
 ---
 
-## The Machine Learning Use Case: NYC Taxi Tipping Propensity
+## The Data, and Two Bugs It Taught Us
 
-To demonstrate these patterns on real-world data without requiring proprietary datasets, this blueprint uses the public **NYC TLC Yellow Taxi Trips** table (`bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022`).
+To keep the demo reproducible without proprietary data, the pipeline uses the public **NYC TLC Yellow Taxi Trips** table in BigQuery (`bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022`). The model is a BigQuery ML logistic regression that estimates whether a completed credit-card trip will earn a tip over $2.00, using four basic trip attributes: vendor, passenger count, distance, and base fare. Every night it scores the previous day's trips into a date-partitioned predictions table.
 
-### Problem Formulation
+Two design rules matter more than the algorithm. Every prediction carries a deterministic join key, `trip_id`, hashed from the trip's natural attributes because the public table has no primary key, so downstream teams can join each score back to its trip. And the predictions table is partitioned by the logical date of the data (`scoring_date`), never by when the job ran. [Gotcha #1](#1-the-wall-clock-partition-key-trap) shows why.
 
-Suppose a dispatch platform wants to estimate the likelihood that a completed credit-card trip will yield a generous tip (`> $2.00`), helping inform driver incentive and dispatch analytics. We frame this as a **binary classification** task:
+Building on real data surfaced two bugs that have nothing to do with taxis. Both are summarized here. The queries, the full results, and the SQL fixes are in the [data notes runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/data-notes.md).
 
-* **Target label (`is_high_tip`):** `1` when `tip_amount > 2.00`, otherwise `0`.
-* **Features:** `vendor_id` (STRING, used for clustering), `passenger_count` (INT64), `trip_distance` (FLOAT64), and `fare_amount` (FLOAT64, which also serves as our drift canary feature).  
-  *(Notice that `total_amount` is absent from this list. Including it in our initial prototype created a subtle target-leakage bug that we walk through in the very next section.)*
-* **Model:** BigQuery ML Logistic Regression (`LOGISTIC_REG`), trained with a chronological sequential split (`data_split_method = 'SEQ'`) on `pickup_datetime` so future trips never leak into the training fold.
-* **Scoring cadence:** A nightly batch job that scores the previous day's partition and writes predictions to a date-partitioned destination table.
+### Bug 1: A Target Leak Small Enough to Pass Review
 
-### Two Data Contract Rules That Matter More Than the Algorithm
+Our first feature set included `total_amount`. It compiled, passed the tests, and looked ordinary in review. But in the taxi schema, `total_amount` *includes* `tip_amount`, and the label is derived from `tip_amount`, so the model was being handed part of the answer.
 
-Most batch prediction tables fail downstream consumers for mundane data-engineering reasons rather than model choice:
+The leak lifted holdout ROC-AUC only from **0.77 to 0.81**, and that is what makes it dangerous. A leak that pushes AUC to 0.99 gets questioned. One that nudges it to 0.81 looks respectable, passes review, and then fails in production, where the leaked column is not populated yet at prediction time.
 
-1. **Every prediction row needs a deterministic join key.** The NYC taxi public table does not have a primary key column. If your predictions table only outputs `vendor_id` (which has just 4 distinct values) alongside a predicted probability, the table is effectively write-only: downstream applications have no way to join a prediction back to the specific trip it describes. During ingestion, we synthesize a deterministic surrogate key (`trip_id`) by hashing the natural attributes of the trip:
-
-```sql
-TO_HEX(MD5(FORMAT('%t|%t|%s|%t|%t',
-  pickup_datetime, dropoff_datetime, vendor_id, trip_distance, total_amount
-))) AS trip_id
-```
-
-2. **Always partition by the logical date of the data (`scoring_date`), never by the wall-clock time the job ran (`scored_at`).** Why this distinction saves you during backfills is covered in [Gotcha #1](#1-the-wall-clock-partition-key-trap).
-
-> 💡 **Why `auto_class_weights` is turned off:**  
-> On valid credit-card trips in the training window, **61.7% have a tip over $2.00**, so the classes are already balanced. Class weighting would distort the predicted probabilities, and any business rule that multiplies a probability by a dollar amount (such as `P(high tip) * bonus_amount`) needs those probabilities to stay calibrated.
-
----
-
-## The Bug We Caught: Target Leakage
-
-If you work with tabular data in healthcare, finance, or logistics, this is the single most portable lesson in the article.
-
-When we first wired up the feature table for the prototype, we included five input columns: `vendor_id`, `passenger_count`, `trip_distance`, `fare_amount`, and **`total_amount`**. Every SQL query compiled cleanly, unit tests passed, and the code looked completely ordinary in review. Yet `total_amount` leaked the target label directly into the model.
-
-### The arithmetic behind the leak
-
-In the NYC TLC schema, the total amount charged to the passenger is defined as:
-
-```
-total_amount = fare_amount + extra + mta_tax + tip_amount
-             + tolls_amount + imp_surcharge + airport_fee
-```
-
-Meanwhile, our binary target label is:
-
-```
-is_high_tip = (tip_amount > 2.00)
-```
-
-Because `total_amount` is the sum of `fare_amount`, taxes, surcharges, and **`tip_amount`**, the feature vector contains the exact quantity the model is trying to predict.
-
-### Measuring the leak on 830,000 real trips
-
-If both `total_amount` and `fare_amount` are handed to a model, subtracting one from the other isolates the tip plus a few dollars of fixed taxes and surcharges. Across the **830,783 card-paid trips** in our January 2022 training window, this one-line rule:
-
-```sql
-(total_amount - fare_amount) > 5.5
-```
-
-reproduces `is_high_tip` with **87.1% accuracy** without training a machine learning model at all.
-
-### How it showed up in BigQuery ML
-
-When we trained two identical BigQuery ML logistic regression models on those same trips—Model A with `total_amount` included, and Model B with `total_amount` removed—here is how they scored on the chronological holdout split:
-
-| Model | Feature Set | Holdout ROC-AUC | Accuracy | Log Loss |
-| :--- | :--- | ---: | ---: | ---: |
-| **Model A (leaky)** | Includes `total_amount` | **0.8111** | 0.7563 | 0.5779 |
-| **Model B (clean)** | `total_amount` removed | **0.7689** | 0.7463 | 0.6046 |
-
-Notice something surprising: **the ROC-AUC only jumped to 0.81, not 0.99.** Because logistic regression is a regularized linear model, exploiting `total_amount - fare_amount` requires assigning a large positive weight to one column and a large negative weight to a highly collinear column—exactly the pattern that L2 regularization penalizes. A gradient-boosted tree (`BOOSTED_TREE_CLASSIFIER`) would isolate the difference across a few splits and inflate the offline AUC much further.
-
-> ⚠️ **Why a subtle leak is more dangerous than an obvious one:**  
-> When a leaked feature pushes offline ROC-AUC to `0.99`, every data scientist in the room gets suspicious and checks the schema. When a leak nudges ROC-AUC from `0.77` to `0.81`, nobody questions it—the model looks respectable, passes review, deploys to production, and then fails when real-time requests arrive before the leaked column is populated.
-
-### The timeline check that catches this immediately
-
-Even without running a query, you can spot target leakage by asking **when** each column becomes knowable in the real world:
-
-| Point in the Trip Lifecycle | Is `fare_amount` known? | Is `total_amount` known? |
-| :--- | :--- | :--- |
-| Passenger requests ride | Estimable | No |
-| Ride finishes at curb (**when we want the prediction**) | **Yes** | **No** |
-| Card payment settles with tip | Yes | **Yes** (alongside `tip_amount`) |
-
-By the moment `total_amount` is recorded, `tip_amount` is already settled and you no longer need a prediction. **If a column is not available at the exact moment a decision is made, it cannot be a feature.**
-
-### Three checks to run on any tabular dataset
+The rule that catches it needs no query: **if a column is not available at the moment the decision is made, it cannot be a feature.** Three checks apply to any tabular dataset:
 
 1. **Expand every composite column.** Write out the arithmetic definition of any `total_*`, `net_*`, `final_*`, or `_summary` column. If the label or a descendant of the label sits inside the formula, drop the column from your feature view.
 2. **Plot columns on an event timeline.** Verify that every feature is recorded *before* the prediction timestamp.
 3. **Test a one-line SQL heuristic.** If a simple subtraction or ratio of two features predicts the label with 85%+ accuracy, check whether you are measuring a post-event accounting identity rather than customer behavior.
 
-### How the canonical SQL view enforces the fix
+The fix lives in one place. Training, evaluation, and inference all read the same canonical view, which no longer projects `total_amount`, and a regression test stops it from coming back. ([Full story](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/data-notes.md#3-bug-1-target-leakage-in-full))
 
-Because training, evaluation, and batch inference all read from a single canonical view (`v_taxi_features`), removing `total_amount` in one file fixed all three stages simultaneously:
+### Bug 2: A Label That Was Never Recorded
 
-```sql
-CREATE OR REPLACE VIEW `project.dataset.v_taxi_features` AS
-SELECT
-  trip_id,
-  scoring_date,
-  pickup_datetime,
-  vendor_id,
-  passenger_count,
-  trip_distance,
-  fare_amount,
-  -- total_amount deliberately absent: it contains tip_amount, and the label is
-  -- derived from tip_amount. Excluding it HERE removes it from training,
-  -- evaluation and inference simultaneously.
-  is_high_tip
-FROM `project.dataset.taxi_trips_features`
-WHERE vendor_id IS NOT NULL
-  AND passenger_count > 0
-  AND trip_distance > 0
-  AND fare_amount BETWEEN 2.50 AND 100.00
-  -- Still referenced as a DATA QUALITY predicate. Filtering on a column is not
-  -- the same as learning from it: this drops corrupt rows without ever exposing
-  -- the value to the model.
-  AND total_amount > 0;
-```
+When we grouped the zero-tip rate by payment type, cash trips came back **100.0% zero-tip**: not 99.8%, but every one of nearly a quarter of a million trips. Riders do not unanimously stiff their drivers. Taxi meters only record tips paid by card, so every cash tip is written as `0.00`.
 
-We keep `total_amount > 0` in the `WHERE` clause as a data-quality filter (dropping corrupt negative-charge records) while excluding `total_amount` from the `SELECT` list so the model never sees its value. A regression test in [`tests/test_config.py`](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/tests/test_config.py) strips SQL comments and verifies that `total_amount` can never be added back to the feature projection:
-
-```python
-@pytest.mark.parametrize("template", ["batch_inference.sql", "evaluate_model.sql"])
-def test_runtime_consumers_never_select_total_amount(self, monkeypatch, template):
-    monkeypatch.setenv("GCP_PROJECT_ID", "p")
-    sql = strip_sql_comments(PipelineConfig().load_sql(template))
-    assert "total_amount" not in sql, f"{template} selects the leaked column"
-```
-
-With the leaked column removed, the honest logistic regression achieves an **ROC-AUC of ~0.77** using only vendor, passenger count, distance, and base fare. That modest score is realistic for four basic trip attributes, so the repository sets `MIN_HOLDOUT_ROC_AUC = 0.60` as its warning floor.
-
-**What about BigQuery ML's `TRANSFORM` clause?** Put stateful preprocessing such as `ML.STANDARD_SCALER` or `ML.QUANTILE_BUCKETIZE` inside `CREATE MODEL ... TRANSFORM(...)` whenever a model needs it, because `TRANSFORM` freezes the training statistics inside the model artifact. This four-feature `LOGISTIC_REG` model does not need it: BigQuery ML already standardizes numeric features and one-hot encodes strings automatically, and leaving `TRANSFORM` out lets passthrough keys such as `trip_id` flow through `ML.PREDICT` without being declared in the model signature.
-
----
-
-## The Second Bug: A Label That Was Never Recorded
-
-Target leakage gets plenty of attention in ML textbooks. This second bug rarely gets mentioned, yet it is just as common when working with operational or public datasets.
-
-While profiling the January 2022 training window in `bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022`, we grouped the zero-tip rate by `payment_type`:
-
-```sql
-SELECT
-  CAST(payment_type AS STRING) AS payment_type,
-  COUNT(*)                                    AS trips,
-  ROUND(COUNTIF(tip_amount = 0)/COUNT(*)*100, 1) AS pct_zero_tip
-FROM `bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022`
-WHERE DATE(pickup_datetime) BETWEEN '2022-01-01' AND '2022-01-15'
-GROUP BY 1 ORDER BY trips DESC
-```
-
-Here is what BigQuery returns:
-
-| `payment_type` | Meaning | Trip Count | % with `tip_amount = 0` |
-| :--- | :--- | ---: | ---: |
-| `1` | Credit card | 857,390 | 4.1% |
-| `2` | **Cash** | 245,882 | **100.0%** |
-| `0` | Unknown / not recorded | 27,113 | 15.4% |
-| `3`, `4` | No charge / disputed | 10,846 | ~98% |
-
-Look at row `2`: **not 99.8%, but 100.0% across 245,882 trips.** In real human behavior, a quarter of a million riders do not unanimously stiff their taxi drivers.
-
-What you are looking at is an instrumentation artifact: **NYC taxi meters only record tips paid electronically by credit card.** When a passenger hands the driver a $5 bill in cash, the meter has no way of knowing, so the database writes `tip_amount = 0.00`.
-
-### What happens if you leave cash trips in the training set
-
-Those 245,882 cash trips make up **22% of the training window**, and every single one carries the label `is_high_tip = 0` regardless of distance or fare. If you train on them:
-
-* Over a fifth of your training labels are false negatives created by the payment terminal.
-* Because `payment_type` is not one of the model features (including it would simply teach the model the trivial rule *"cash means zero"*), those 245,882 rows act as pure label noise, dragging predicted probabilities downward across every trip.
-
-Adding a single label-validity predicate to the canonical view resolves the issue:
-
-```sql
-  -- Credit card only. This is a LABEL VALIDITY filter, not a data-cleaning one.
-  -- TLC records tip_amount only for card payments; cash tips are always written
-  -- as 0.00 because the meter never saw them. That is 22% of the training
-  -- window, every row labelled is_high_tip = 0 regardless of the trip.
-  AND payment_type = '1';
-```
-
-Filtering to credit-card transactions (`payment_type = '1'`) increases the correlation between `trip_distance` and `is_high_tip` from **0.190 to 0.258**—recovering more than a third of the underlying signal simply by excluding rows where the label was never observed.
-
-It also sharpens the business definition of the model. Instead of claiming to answer *"Will this passenger tip?"*, the model answers the question the data can truthfully support: **"Given a credit-card trip, will the tip exceed $2.00?"**
+Those trips were 22% of the training window, all labelled "no high tip" whatever the trip looked like. Filtering the canonical view to card payments recovered more than a third of the signal. It also sharpened what the model claims to answer: not *"Will this passenger tip?"* but **"Given a credit-card trip, will the tip exceed $2.00?"** ([Full story](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/data-notes.md#4-bug-2-the-unrecorded-label-in-full))
 
 > 💡 **Takeaway for public and enterprise datasets:**  
 > Before training a classifier, run a `GROUP BY` of your positive label rate across every major categorical dimension (`payment_type`, `channel`, `region`, `device_type`, `vendor`). Whenever a segment shows **0.0%** or **100.0%**, assume you have found an unrecorded logging path rather than customer behavior.
@@ -310,27 +145,11 @@ It also sharpens the business definition of the model. Instead of claiming to an
 
 ## Where Does the Data Come From?
 
-Almost every batch ML tutorial glosses over how new partitions arrive in the feature table. That omission is why so many tutorial pipelines run once on day one and fail 24 hours later.
+Almost every batch ML tutorial glosses over how new partitions arrive. In production, **a batch scoring job scores a partition; it does not ingest raw data.** Your upstream ETL (Dataflow, Datastream, Fivetran, dbt, or Composer) owns landing each day's partition in `taxi_trips_features`, and retries and pages its own team when a load fails. This pipeline owns validating and scoring what landed. If the partition is missing or too small, it **halts with exit code `2`**, writes nothing, and fires an alert. It never fabricates data or scores a half-loaded table.
 
-### Defining the responsibility boundary
+The shipped `MIN_ROW_COUNT = 1` is only a presence check, because a template cannot know your volumes. Against real data, set the floor to about half your median daily row count (for example, `make tf-apply MIN_ROW_COUNT=50000`) so partial loads are caught too.
 
-In production, **a batch scoring job scores a partition; it does not ingest raw upstream data.** Those two jobs have different owners and opposite responses to missing data:
-
-* **Upstream ETL (Dataflow, Datastream, Fivetran, dbt, or Composer):** Owns landing `taxi_trips_features` before the scoring window opens. If a load fails, the ETL system retries and pages the data engineering team.
-* **This Scoring Pipeline:** Owns validating and scoring the partition that landed. If today's partition is missing, the scoring job must **halt immediately with exit code `2`**, write zero rows to `taxi_predictions`, and fire an alert—never fabricate data or score a half-loaded table.
-
-One important configuration detail: the shipped default in this repository is `MIN_ROW_COUNT = 1`. That default acts as a **presence check** (catching a completely empty partition) because a generic template cannot guess your organization's daily transaction volume. Once you deploy against real data, query your median daily row count over the trailing 30 days, cut it in half, and pass that floor via Terraform so partial upstream loads are caught too:
-
-```bash
-make tf-apply MIN_ROW_COUNT=50000
-```
-
-### Keeping the public-dataset demo alive past day one (Phase 0)
-
-The 2022 public dataset is historical, so no upstream ETL lands rows for "yesterday", and the second night's scheduled run would halt on an empty partition. For the demo only, an optional **Phase 0** (`src/ingest.py`, switched on by `ENABLE_DEMO_INGESTION=true`) fills a missing partition by mapping the target date onto a rotating 28-day window of February 2022 trips. It never overwrites a partition that already exists, and it leaves the Phase 1 guardrail untouched.
-
-> ⚠️ **Production deployment rule:**  
-> Always deploy real environments with `make tf-apply ENABLE_DEMO_INGESTION=false`, so that a missing upstream partition halts the pipeline as designed.
+Because the 2022 public dataset never gets new rows, the demo includes an optional **Phase 0** that fills a missing partition from a rotating window of February 2022 trips, without ever overwriting real data. Always deploy real environments with `ENABLE_DEMO_INGESTION=false`. The [data notes runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/data-notes.md#6-phase-0-keeping-the-demo-alive-past-day-one) shows how Phase 0 works.
 
 ---
 
@@ -906,6 +725,7 @@ What separates a quick demo from a dependable production pipeline is rarely the 
 * [OpenTelemetry Google Cloud Exporters](https://github.com/GoogleCloudPlatform/opentelemetry-operations-python)
 
 ### Data Quality & Drift
+* [Data notes for this blueprint: queries, results, and SQL fixes](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/data-notes.md)
 * [A Practical Introduction to Population Stability Index (PSI)](https://coralogix.com/ai-blog/a-practical-introduction-to-population-stability-index-psi/)
 * [MLOps: Continuous Delivery and Automation Pipelines](https://cloud.google.com/architecture/mlops-continuous-delivery-and-automation-pipelines-in-machine-learning)
 * [Data Validation for Machine Learning (Breck et al., SysML 2019)](https://mlsys.org/Conferences/2019/doc/2019/167.pdf)
