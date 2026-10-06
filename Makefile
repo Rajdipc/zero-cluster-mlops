@@ -61,6 +61,11 @@ DEMO_SOURCE_WINDOW_DAYS  ?= 28
 PSI_DRIFT_THRESHOLD      ?= 0.25
 MIN_ROW_COUNT            ?= 1
 
+# Set false ONLY for the very first apply into a fresh project: the alert
+# policies watch custom metrics that do not exist until the job has run once,
+# and Cloud Monitoring rejects them with a 404 until then. See variables.tf.
+ENABLE_ALERT_POLICIES    ?= true
+
 # Defined once and reused by plan/apply/destroy. Three hand-maintained copies of
 # the same list is how destroy quietly drifts out of sync with apply and then
 # fails to tear down what apply created.
@@ -75,7 +80,8 @@ TF_VARS = -var="project_id=$(GCP_PROJECT_ID)" \
           -var="enable_demo_ingestion=$(ENABLE_DEMO_INGESTION)" \
           -var="demo_source_table=$(DEMO_SOURCE_TABLE)" \
           -var="demo_source_window_start=$(DEMO_SOURCE_WINDOW_START)" \
-          -var="demo_source_window_days=$(DEMO_SOURCE_WINDOW_DAYS)"
+          -var="demo_source_window_days=$(DEMO_SOURCE_WINDOW_DAYS)" \
+          -var="enable_alert_policies=$(ENABLE_ALERT_POLICIES)"
 
 help:
 	@echo "Setup"
@@ -110,6 +116,7 @@ help:
 	@echo "  DEMO_SOURCE_WINDOW_START = $(DEMO_SOURCE_WINDOW_START)  (year must match DEMO_SOURCE_TABLE)"
 	@echo "  PSI_DRIFT_THRESHOLD   = $(PSI_DRIFT_THRESHOLD)"
 	@echo "  MIN_ROW_COUNT         = $(MIN_ROW_COUNT)        (1 = presence check only)"
+	@echo "  ENABLE_ALERT_POLICIES = $(ENABLE_ALERT_POLICIES)   (false only for the first apply in a fresh project)"
 
 venv:
 	@test -d .venv || python3 -m venv .venv

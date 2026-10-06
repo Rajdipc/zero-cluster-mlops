@@ -57,6 +57,26 @@ variable "max_slot_millis_warning" {
   default     = 300000
 }
 
+variable "enable_alert_policies" {
+  type        = bool
+  description = <<-EOT
+    Whether to create the two Cloud Monitoring alert policies.
+
+    Cloud Monitoring refuses to create an alert policy on a custom metric that
+    does not exist yet (HTTP 404 "Cannot find metric(s) that match type ...").
+    The workload.googleapis.com/bqml.* metrics are created by the OpenTelemetry
+    exporter the first time the job runs, so on a FRESH project the very first
+    apply must skip the alerts:
+
+      make deploy ENABLE_ALERT_POLICIES=false   # everything except the alerts
+      make execute                              # first run creates the metrics
+      make tf-apply                             # a few minutes later: alerts
+
+    Leave it true for every apply after that.
+  EOT
+  default     = true
+}
+
 variable "min_row_count" {
   type        = number
   description = <<-EOT

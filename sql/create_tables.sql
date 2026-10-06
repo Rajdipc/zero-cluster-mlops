@@ -61,11 +61,12 @@ OPTIONS(
 -- The label is `tip_amount > 2.00`, and total_amount CONTAINS tip_amount. Using
 -- it as a feature is textbook target leakage: the model is handed the answer.
 --
--- Measured on 1,121,626 real trips (2022-01-01..01-15), this single rule
+-- Measured on the 830,783 card-paid trips in the training window
+-- (2022-01-01..01-15), this single rule
 --
 --     (total_amount - fare_amount) > 5.5
 --
--- classifies the label with 88.8% accuracy. A model given both columns learns
+-- classifies the label with 87.1% accuracy. A model given both columns learns
 -- that subtraction and reports a superb ROC-AUC that collapses in production --
 -- where total_amount is not even known until AFTER the trip is paid for, which
 -- is strictly after the moment you wanted the prediction.
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS `{project_id}.{dataset_id}.{predictions_table}` (
   vendor_id STRING,
   predicted_is_high_tip INT64,
   predicted_is_high_tip_probs ARRAY<STRUCT<label INT64, prob FLOAT64>>
-    OPTIONS(description = "Calibrated probabilities. Classes are near-balanced (~48/52) so no class weighting is applied, which keeps these usable for expected-value math."),
+    OPTIONS(description = "Calibrated probabilities. Classes are ~62/38 in the card-only training window, not skewed enough to justify class weighting, so none is applied and these stay usable for expected-value math."),
   model_name STRING OPTIONS(description = "Model that produced this row, for lineage across retrains."),
   scored_at TIMESTAMP OPTIONS(description = "Audit column: wall-clock execution time. Not the partition key.")
 )

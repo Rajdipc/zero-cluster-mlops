@@ -24,6 +24,6 @@ output "scheduler_service_account_email" {
 }
 
 output "psi_drift_alert_policy_id" {
-  value       = google_monitoring_alert_policy.psi_drift_alert.id
-  description = "Resource ID of the statistical drift alert policy."
+  value       = one(google_monitoring_alert_policy.psi_drift_alert[*].id)
+  description = "Resource ID of the statistical drift alert policy (null while enable_alert_policies = false)."
 }

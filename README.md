@@ -339,7 +339,7 @@ Run the checks in [Verifying It Worked](#verifying-it-worked), then walk the con
 | Console page | What to look for |
 | :--- | :--- |
 | **BigQuery → `ml_production`** | feature table, `v_taxi_features`, `taxi_predictions`, and the `taxi_tip_model` node |
-| **BigQuery → model → Evaluation** | ROC-AUC ≈ **0.71**. A suspiciously good ~0.95 means target leakage is back and `total_amount` has crept into the feature list |
+| **BigQuery → model → Evaluation** | ROC-AUC ≈ **0.77**. Above ~0.80 means target leakage is back and `total_amount` has crept into the feature list (the leaky variant measures 0.81) |
 | **Cloud Run → Jobs → Executions** | one green execution, ~25 s |
 | **Cloud Trace → Trace Explorer** | a single trace spanning the container *and* every BigQuery job it ran |
 | **Metrics Explorer** | the PSI and ROC-AUC gauges — allow ~60 s, the export interval is 60000 ms |

@@ -154,8 +154,8 @@ class TestDemoSourceTable:
 #
 # total_amount = fare + extra + mta_tax + TIP + tolls + surcharge + airport_fee,
 # and the label is `tip_amount > 2.00`. Feeding total_amount to the model hands
-# it the answer: measured on 1,121,626 real trips, the single rule
-# `(total_amount - fare_amount) > 5.5` reproduces the label 88.8% of the time.
+# it the answer: measured on 830,783 card-paid training trips, the single rule
+# `(total_amount - fare_amount) > 5.5` reproduces the label 87.1% of the time.
 #
 # The feature view is the single place that enforces the exclusion, so these
 # tests guard the contract rather than each consumer.
@@ -195,7 +195,7 @@ class TestNoTargetLeakage:
         assert self.LEAKY not in strip_sql_comments(raw)
 
     def test_no_class_weighting(self, monkeypatch):
-        """Classes are ~48/52. Weighting would cost calibration for no benefit."""
+        """Classes are ~62/38. Weighting would cost calibration for no benefit."""
         monkeypatch.setenv("GCP_PROJECT_ID", "p")
         raw = (PipelineConfig().sql_dir / "train_model.sql").read_text()
         assert "auto_class_weights" not in strip_sql_comments(raw)

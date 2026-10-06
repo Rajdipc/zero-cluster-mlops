@@ -13,8 +13,14 @@ resource "google_monitoring_notification_channel" "email" {
 
 # ------------------------------------------------------------------------------
 # Statistical feature distribution drift
+#
+# Both alert policies below watch custom metrics that only exist after the job
+# has run once, and Cloud Monitoring rejects a policy on an unknown metric with
+# a 404. On a fresh project, apply once with enable_alert_policies = false,
+# execute the job, then apply again. See variables.tf.
 # ------------------------------------------------------------------------------
 resource "google_monitoring_alert_policy" "psi_drift_alert" {
+  count        = var.enable_alert_policies ? 1 : 0
   display_name = "ALERT: ML Feature Distribution Drift Detected"
   combiner     = "OR"
 
@@ -67,6 +73,7 @@ resource "google_monitoring_alert_policy" "psi_drift_alert" {
 # Warehouse cost anomaly
 # ------------------------------------------------------------------------------
 resource "google_monitoring_alert_policy" "high_slot_usage" {
+  count        = var.enable_alert_policies ? 1 : 0
   display_name = "WARN: BQML Batch Inference High Slot Usage"
   combiner     = "OR"
 
