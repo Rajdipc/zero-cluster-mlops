@@ -243,7 +243,7 @@ Four things happen, in order:
 3. Loads three windows from `bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2022`:
    * `2022-01-01` → `2022-01-15` — training **and** PSI baseline (~1.14 M rows)
    * source date `2022-02-01`, **remapped to yesterday** so the first scheduled run has something to score
-   * `2022-02-10` — the backfill test partition (~112 K rows)
+   * `2022-02-10` — the backfill test partition (~105 K rows)
 4. Runs `sql/train_model.sql` — logistic regression with a chronological `SEQ` split.
 
 **~4 minutes. ~\$0.01.** It prints a partition summary — **confirm all three partitions are non-empty before continuing.** If the "yesterday" partition is empty, everything downstream fails for reasons that look unrelated.
@@ -273,21 +273,17 @@ The tag is **derived from your commit**, not fixed. On a clean checkout it is th
 ```bash
 gcloud services enable cloudbuild.googleapis.com
 
-gcloud artifacts repositories create bqml-batch-inference \
-  --repository-format=docker --location="$GCP_REGION" 2>/dev/null || true
-
-# Match the tag the Makefile would have produced, so `make tf-apply` finds it.
-IMAGE_TAG="$(git rev-parse --short HEAD)"
-
-gcloud builds submit \
-  --tag "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/bqml-batch-inference/worker:${IMAGE_TAG}" .
+make cloud-build-push    # same repo, same commit-derived tag, built remotely
+make tf-apply            # finds the image because the tag is computed the same way
 ```
 
-Then pass the same tag through to Terraform:
+Or in one step, with a guaranteed-matching tag:
 
 ```bash
-make tf-apply IMAGE_TAG="$IMAGE_TAG"
+make deploy-cloudbuild   # cloud-build-push + tf-apply
 ```
+
+This is how the reference deployment was built: the workstation it ran on had no Docker daemon. A first build takes about a minute.
 
 </details>
 
@@ -593,12 +589,12 @@ make execute && make execute
 ```
 
 ```sql
-SELECT scoring_date, COUNT(1) AS rows, COUNT(DISTINCT trip_id) AS unique_trips
+SELECT scoring_date, COUNT(1) AS row_count, COUNT(DISTINCT trip_id) AS unique_trips
 FROM `ml_production.taxi_predictions`
 GROUP BY scoring_date ORDER BY scoring_date;
 ```
 
-`rows` must equal `unique_trips`.
+`row_count` must equal `unique_trips`.
 
 ### Circuit breaker: drift halts before any write
 
@@ -617,7 +613,7 @@ gcloud run jobs execute bqml-taxi-batch-worker --region="${GCP_REGION}" \
 ```
 
 ```sql
-SELECT scoring_date, MIN(scored_at) AS first_scored_at, COUNT(1) AS rows
+SELECT scoring_date, MIN(scored_at) AS first_scored_at, COUNT(1) AS row_count
 FROM `ml_production.taxi_predictions`
 GROUP BY scoring_date ORDER BY scoring_date;
 ```

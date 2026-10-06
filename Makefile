@@ -3,8 +3,8 @@
 # ==============================================================================
 
 .PHONY: help venv install test lint check-env check-deploy-env seed run-local \
-        docker-build docker-push tf-init tf-plan tf-apply tf-destroy deploy \
-        execute clean
+        docker-build docker-push cloud-build-push tf-init tf-plan tf-apply \
+        tf-destroy deploy deploy-cloudbuild execute clean
 
 GCP_PROJECT_ID ?= $(shell gcloud config get-value project 2>/dev/null)
 GCP_REGION     ?= us-central1
@@ -91,6 +91,8 @@ help:
 	@echo "  make docker-push   Push to Artifact Registry (creates repo if needed)"
 	@echo "  make tf-apply      Provision Cloud Run Job, Scheduler, IAM and alerts"
 	@echo "  make deploy        docker-push + tf-apply with a guaranteed-matching tag"
+	@echo "  make cloud-build-push   Build on Cloud Build instead (no local Docker)"
+	@echo "  make deploy-cloudbuild  cloud-build-push + tf-apply"
 	@echo "  make execute       Trigger one Cloud Run Job execution and wait"
 	@echo ""
 	@echo "Teardown"
@@ -158,13 +160,33 @@ run-local:
 docker-build:
 	docker build -t $(IMAGE_URI) .
 
+# Every gcloud call below passes --project explicitly.
+#
+# GCP_PROJECT_ID can come from the environment, and bq/terraform honour it. A
+# bare gcloud call does not: it uses `gcloud config get-value project`. When the
+# two differ, the repo gets created -- and `make execute` runs -- in whatever
+# project gcloud last pointed at. Found on the first real deploy.
 docker-push: check-env
-	@gcloud artifacts repositories describe $(REPO) --location=$(GCP_REGION) >/dev/null 2>&1 || \
+	@gcloud artifacts repositories describe $(REPO) --location=$(GCP_REGION) \
+		--project=$(GCP_PROJECT_ID) >/dev/null 2>&1 || \
 		gcloud artifacts repositories create $(REPO) \
-			--repository-format=docker --location=$(GCP_REGION)
+			--repository-format=docker --location=$(GCP_REGION) \
+			--project=$(GCP_PROJECT_ID)
 	@gcloud auth configure-docker $(GCP_REGION)-docker.pkg.dev --quiet
 	docker build -t $(IMAGE_URI) .
 	docker push $(IMAGE_URI)
+
+# Same result as docker-push, but the build runs on Cloud Build. Use it when the
+# local Docker daemon is missing or broken (recycled Cloud Shell VMs, corporate
+# workstations, CI runners without Docker-in-Docker).
+cloud-build-push: check-env
+	@gcloud artifacts repositories describe $(REPO) --location=$(GCP_REGION) \
+		--project=$(GCP_PROJECT_ID) >/dev/null 2>&1 || \
+		gcloud artifacts repositories create $(REPO) \
+			--repository-format=docker --location=$(GCP_REGION) \
+			--project=$(GCP_PROJECT_ID)
+	gcloud builds submit --project=$(GCP_PROJECT_ID) --region=$(GCP_REGION) \
+		--tag $(IMAGE_URI) .
 
 tf-init:
 	terraform -chdir=terraform init
@@ -189,8 +211,13 @@ tf-destroy: check-deploy-env
 deploy: docker-push tf-apply
 	@echo "Deployed $(IMAGE_URI)"
 
+# deploy, minus the local Docker dependency.
+deploy-cloudbuild: cloud-build-push tf-apply
+	@echo "Deployed $(IMAGE_URI)"
+
 execute:
-	gcloud run jobs execute $(JOB_NAME) --region=$(GCP_REGION) --wait
+	gcloud run jobs execute $(JOB_NAME) --region=$(GCP_REGION) \
+		--project=$(GCP_PROJECT_ID) --wait
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

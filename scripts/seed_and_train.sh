@@ -54,9 +54,15 @@ echo "  Model           : ${MODEL_NAME}"
 echo "  Training window : ${TRAIN_START} .. ${TRAIN_END}"
 echo "========================================================================"
 
+# The query goes in on stdin, NOT as a positional argument.
+#
+# Every SQL file in sql/ opens with a '-- ====' comment banner. Passed as an
+# argument, that leading '--' is parsed by bq's flag parser as a flag, and bq
+# aborts with "FATAL Flags parsing error: Unknown command line flag ' '" before
+# a single byte reaches BigQuery. stdin is never flag-parsed.
 run_query() {
   bq query --use_legacy_sql=false --location="${BQ_LOCATION}" \
-           --project_id="${PROJECT_ID}" "$1"
+           --project_id="${PROJECT_ID}" <<< "$1"
 }
 
 render() {
@@ -151,7 +157,7 @@ WHERE vendor_id IS NOT NULL
   AND fare_amount BETWEEN 2.50 AND 100.00
   AND total_amount > 0
 -- The synthesized key must be unique within a partition, otherwise the
--- 'rows == unique_trips' idempotency assertion in the README is meaningless.
+-- 'row_count == unique_trips' idempotency assertion in the README is meaningless.
 QUALIFY ROW_NUMBER() OVER (
   PARTITION BY
     make_trip_id(pickup_datetime, dropoff_datetime, vendor_id, trip_distance, total_amount),
@@ -167,7 +173,7 @@ echo
 echo "      Partition summary:"
 bq query --use_legacy_sql=false --location="${BQ_LOCATION}" \
          --project_id="${PROJECT_ID}" --format=pretty "
-SELECT scoring_date, COUNT(1) AS rows, COUNTIF(is_high_tip = 1) AS high_tip
+SELECT scoring_date, COUNT(1) AS row_count, COUNTIF(is_high_tip = 1) AS high_tip
 FROM \`${PROJECT_ID}.${DATASET_ID}.${FEATURES_TABLE}\`
 GROUP BY scoring_date ORDER BY scoring_date
 "
