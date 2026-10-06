@@ -101,7 +101,7 @@ Run `make help` at any time to see every target and your current settings.
 | Google Cloud SDK, authenticated | `gcloud auth list` |
 | Application Default Credentials | `gcloud auth application-default login` |
 | Python ≥ 3.11 | `python3 --version` |
-| Docker | `docker info` |
+| Docker **or** Cloud Build | `docker info`; without a daemon, `gcloud services enable cloudbuild.googleapis.com` and use `make deploy-cloudbuild` |
 | Terraform ≥ 1.5 | `terraform version` |
 | Billing enabled on the project | required for BigQuery queries |
 
@@ -685,10 +685,17 @@ Terraform ships `max_retries = 0`. Because Phase 3 clears the partition before r
 ## Cleanup
 
 ```bash
-make tf-destroy
+make tf-destroy        # the 13 Terraform-managed resources (needs terraform/terraform.tfstate)
 
 gcloud artifacts repositories delete bqml-batch-inference \
-  --location="${GCP_REGION}" --quiet
+  --location="${GCP_REGION}" --project="${GCP_PROJECT_ID}" --quiet
+
+# train_model.sql registers the model in Vertex AI; dropping the dataset does not remove it.
+gcloud ai models delete taxi_tip_model \
+  --region=us-central1 --project="${GCP_PROJECT_ID}" --quiet
+
+# Only if you used make cloud-build-push / deploy-cloudbuild: Cloud Build's source staging bucket.
+gcloud storage rm -r "gs://${GCP_PROJECT_ID}_cloudbuild/source/**"
 ```
 
 > [!CAUTION]
