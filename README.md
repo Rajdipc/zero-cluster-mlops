@@ -233,7 +233,7 @@ make install
 make test
 ```
 
-Expect **118 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
+Expect **119 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
 
 ### Step 5 — Seed BigQuery and train  ⚠️ *first step that costs money*
 
@@ -442,7 +442,7 @@ zero-cluster-mlops/
 │   ├── blog/                   # Companion article (Markdown)
 │   └── images/                 # Rendered diagrams and data tables
 │
-└── tests/                      # 118 tests, no cloud access required
+└── tests/                      # 119 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
     ├── test_terraform_contract.py # Terraform <-> container config seam

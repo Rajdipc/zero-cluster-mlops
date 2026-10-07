@@ -209,11 +209,14 @@ resource "google_monitoring_alert_policy" "job_execution_failed" {
     display_name = "Cloud Run Job ended abnormally"
 
     condition_matched_log {
+      # Parentheses are matched with [(] and [)], not \\( and \\): backslashes pass
+      # through two layers of escaping (HCL, then the Logging query language), and
+      # the escaped form deployed earlier never matched anything.
       filter = join(" AND ", [
         "resource.type=\"cloud_run_job\"",
         "resource.labels.job_name=\"${local.run_job_name}\"",
         "log_id(\"run.googleapis.com/varlog/system\")",
-        "(textPayload=~\"Container called exit\\\\((1|[4-9]|[1-9][0-9]+)\\\\)\" OR textPayload=~\"(?i)terminated on signal|memory limit\")",
+        "(textPayload=~\"Container called exit[(](1|[4-9]|[1-9][0-9]+)[)]\" OR textPayload=~\"(?i)terminated on signal|memory limit\")",
       ])
     }
   }

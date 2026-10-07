@@ -390,3 +390,20 @@ def test_scheduler_calls_the_run_api_with_an_oauth_token():
     assert "oauth_token" in tf
     assert "oidc_token" not in tf
     assert "https://www.googleapis.com/auth/cloud-platform" in tf
+
+
+def test_crash_backstop_matches_only_codes_without_a_status_email():
+    """The backstop's exit-code regex, as shipped, must match exit(1) and exit(137)
+    but not 0, 2 or 3 (those send a status email). An earlier version escaped the
+    parentheses with backslashes, which survived HCL and the Logging query language
+    as a literal backslash and never matched a real log line."""
+    tf = _monitoring_tf()
+    block = tf[tf.index('resource "google_monitoring_alert_policy" "job_execution_failed"'):]
+    block = block[:block.index("\nresource ")]
+    m = re.search(r'textPayload=~\\"(Container called exit[^"\\]*)\\"', block)
+    assert m, "exit-code regex not found, or it contains a backslash"
+    pattern = re.compile(m.group(1))
+    for code in (1, 4, 9, 10, 137):
+        assert pattern.search(f"Container called exit({code})."), code
+    for code in (0, 2, 3):
+        assert not pattern.search(f"Container called exit({code})."), code
