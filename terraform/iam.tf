@@ -52,7 +52,7 @@ resource "google_bigquery_dataset_iam_member" "runner_dataset_editor" {
 resource "google_service_account" "scheduler_sa" {
   account_id   = "sa-bqml-scheduler-invoker"
   display_name = "Cloud Scheduler Batch Invoker"
-  description  = "Used by Cloud Scheduler to trigger the Cloud Run Job via OIDC."
+  description  = "Used by Cloud Scheduler to trigger the Cloud Run Job (OAuth token)."
 }
 
 # Invoker rights on this specific job only, not project-wide run.invoker.

@@ -117,3 +117,103 @@ resource "google_monitoring_alert_policy" "high_slot_usage" {
     EOT
   }
 }
+
+# ------------------------------------------------------------------------------
+# Run failures: the job did not start, or it exited non-zero
+#
+# The two policies above only see metrics the job emits while it runs. If the
+# scheduler cannot start the job, or the job halts before it records a PSI above
+# the alert threshold (a missing partition, an InsufficientDataException, a
+# crash), nothing is emitted and nothing fires. These two log-match policies
+# close that gap. They watch platform logs rather than custom metrics, so they
+# exist from the first apply and do not need enable_alert_policies.
+# ------------------------------------------------------------------------------
+resource "google_monitoring_alert_policy" "scheduler_trigger_failed" {
+  display_name = "ALERT: Scheduler Failed to Start the BQML Batch Job"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Cloud Scheduler attempt finished with an error"
+
+    condition_matched_log {
+      filter = join(" AND ", [
+        "resource.type=\"cloud_scheduler_job\"",
+        "resource.labels.job_id=\"${google_cloud_scheduler_job.batch_trigger.name}\"",
+        "severity>=ERROR",
+      ])
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email.name]
+
+  alert_strategy {
+    notification_rate_limit {
+      period = "3600s"
+    }
+    auto_close = "86400s"
+  }
+
+  documentation {
+    mime_type = "text/markdown"
+    content   = <<-EOT
+      Cloud Scheduler tried to start the nightly scoring job and the Cloud Run
+      API rejected the call, so **no scoring ran tonight**.
+
+      **Triage**
+      1. Open the Cloud Scheduler job's logs and read `jsonPayload.status`.
+      2. `UNAUTHENTICATED` (401): the trigger must use an OAuth token, not OIDC,
+         because the target is a `*.googleapis.com` API.
+      3. `PERMISSION_DENIED` (403): the scheduler service account lost
+         `roles/run.invoker` on the job.
+      4. After fixing, backfill the missed date with
+         `--update-env-vars=TARGET_DATE=YYYY-MM-DD`.
+    EOT
+  }
+}
+
+resource "google_monitoring_alert_policy" "job_execution_failed" {
+  display_name = "ALERT: BQML Batch Job Exited Non-Zero"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "Cloud Run Job container exited with a non-zero code"
+
+    condition_matched_log {
+      # Cloud Run writes "Container called exit(N)." to the system log for every
+      # task. Match any N other than 0: 2 = guardrail halt, 3 = unexpected error.
+      filter = join(" AND ", [
+        "resource.type=\"cloud_run_job\"",
+        "resource.labels.job_name=\"${google_cloud_run_v2_job.inference_job.name}\"",
+        "log_id(\"run.googleapis.com/varlog/system\")",
+        "textPayload=~\"Container called exit\\\\([1-9][0-9]*\\\\)\"",
+      ])
+      label_extractors = {
+        exit_message = "EXTRACT(textPayload)"
+      }
+    }
+  }
+
+  notification_channels = [google_monitoring_notification_channel.email.name]
+
+  alert_strategy {
+    notification_rate_limit {
+      period = "3600s"
+    }
+    auto_close = "86400s"
+  }
+
+  documentation {
+    mime_type = "text/markdown"
+    content   = <<-EOT
+      The nightly scoring job exited non-zero, so predictions for the target
+      date were **not** written (or not fully written).
+
+      **Triage**
+      - `exit(2)`: guardrail halt. Search the execution's logs for
+        `Guardrail halted the pipeline` to see whether it was drift or a missing
+        or short partition. Do not retry; fix the input data.
+      - `exit(3)`: unexpected failure (BigQuery 5xx, quota, network). Writes are
+        idempotent, so re-running the same `TARGET_DATE` is safe.
+    EOT
+  }
+}

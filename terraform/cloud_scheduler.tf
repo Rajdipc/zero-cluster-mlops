@@ -12,9 +12,13 @@ resource "google_cloud_scheduler_job" "batch_trigger" {
     http_method = "POST"
     uri         = "https://${var.region}-run.googleapis.com/v2/projects/${var.project_id}/locations/${var.region}/jobs/${google_cloud_run_v2_job.inference_job.name}:run"
 
-    oidc_token {
+    # OAuth, not OIDC. This URI is a Google API (*.googleapis.com), and Google
+    # APIs only accept OAuth access tokens. An oidc_token here is rejected with
+    # 401 UNAUTHENTICATED at every scheduled attempt, so the job silently never
+    # runs. OIDC is for calling your own Cloud Run services or functions.
+    oauth_token {
       service_account_email = google_service_account.scheduler_sa.email
-      audience              = "https://${var.region}-run.googleapis.com/"
+      scope                 = "https://www.googleapis.com/auth/cloud-platform"
     }
   }
 
