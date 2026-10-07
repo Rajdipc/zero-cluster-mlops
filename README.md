@@ -23,7 +23,7 @@ Production-grade batch ML inference executed **inside** BigQuery, orchestrated b
 | [Verifying It Worked](#verifying-it-worked) | idempotency, circuit breaker, backfill |
 | [Exit Codes](#exit-codes) | `0` / `2` / `3` and when to retry |
 | [Troubleshooting](#troubleshooting) | symptom → cause → fix |
-| [**Production Gotchas**](docs/production-gotchas.md) *(separate page)* | six failure modes, the fix, the test, and a check for your deployment |
+| [**Production Gotchas**](docs/production-gotchas.md) *(separate page)* | seven failure modes, the fix, the test, and a check for your deployment |
 | [Known Limitations](#known-limitations) | what this deliberately does not do |
 | [Cleanup](#cleanup) | tear it all down |
 
@@ -233,7 +233,7 @@ make install
 make test
 ```
 
-Expect **117 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
+Expect **118 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
 
 ### Step 5 — Seed BigQuery and train  ⚠️ *first step that costs money*
 
@@ -438,11 +438,11 @@ zero-cluster-mlops/
 │
 ├── docs/
 │   ├── data-notes.md           # Dataset, the two data bugs, Phase 0 in full
-│   ├── production-gotchas.md   # Six failure modes: fix, test, how to check
+│   ├── production-gotchas.md   # Seven failure modes: fix, test, how to check
 │   ├── blog/                   # Companion article (Markdown)
 │   └── images/                 # Rendered diagrams and data tables
 │
-└── tests/                      # 117 tests, no cloud access required
+└── tests/                      # 118 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
     ├── test_terraform_contract.py # Terraform <-> container config seam
@@ -690,7 +690,7 @@ Why the codes are split this way, and a one-line check of the retry setting on y
 | `Demo ingestion misconfigured: DEMO_SOURCE_TABLE points at year ...` | Source table year and window year disagree | Set both to the same year. This is a startup guard, not a runtime failure — it is doing its job |
 | Seeded successfully but every partition is empty | Pointed at `tlc_yellow_trips_2023`, which **exists but has 0 rows** | Use 2011–2022. Only those are populated |
 | Predictions in today's partition after a backfill | Partitioned on `scored_at` | Partition on `scoring_date` |
-| No execution at 02:00 UTC; scheduler log shows `UNAUTHENTICATED` / 401 | Scheduler sends an OIDC token to the Cloud Run Admin API | Use `oauth_token` with the `cloud-platform` scope (shipped in `terraform/cloud_scheduler.tf`) |
+| No execution at 02:00 UTC; scheduler log shows `UNAUTHENTICATED` / 401 | Scheduler sends an OIDC token to the Cloud Run Admin API | Use `oauth_token` with the `cloud-platform` scope (shipped in `terraform/cloud_scheduler.tf`). Full write-up: [Production Gotchas § 7](docs/production-gotchas.md#7-the-trigger-that-fires-but-never-runs) |
 | Job failed but no email arrived | Only the drift and slot alerts existed; they need the job to emit metrics | The log-based alerts in `terraform/monitoring.tf` send a status email for every run, plus alerts for a crash or a missed start |
 
 Several of these rows (location, metric interval, script jobs, backfill partition) are written up in full, with the code and a check you can run, in [Production Gotchas](docs/production-gotchas.md).

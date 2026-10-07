@@ -1,6 +1,6 @@
 # Production Gotchas: The Full Write-Up
 
-This runbook holds the detail behind the six "Production Gotchas" in the [Zero-Cluster MLOps blueprint](https://github.com/Rajdipc/zero-cluster-mlops). The [companion blog post](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/blog/zero-cluster-mlops-blueprint.md) gives a short summary of each one. Here you get, for each gotcha, what goes wrong, the fix with the shipped code, where the repository enforces it, and a command to confirm it on your own deployment.
+This runbook holds the detail behind the seven "Production Gotchas" in the [Zero-Cluster MLOps blueprint](https://github.com/Rajdipc/zero-cluster-mlops). The [companion blog post](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/blog/zero-cluster-mlops-blueprint.md) gives a short summary of each one. Here you get, for each gotcha, what goes wrong, the fix with the shipped code, where the repository enforces it, and a command to confirm it on your own deployment.
 
 The commands assume the default names from `terraform/variables.tf` (job `bqml-taxi-batch-worker`, dataset `ml_production`) and that `PROJECT_ID` and `GCP_REGION` are set as in the [Cloud Shell runbook](../README.md#deploying-from-google-cloud-shell).
 
@@ -12,7 +12,8 @@ The commands assume the default names from `terraform/variables.tf` (job `bqml-t
 4. [Cloud Monitoring's 5-second write limit on short-lived jobs](#4-cloud-monitorings-5-second-write-limit-on-short-lived-jobs)
 5. [`GCP_REGION` is not `BQ_LOCATION`](#5-gcp_region-is-not-bq_location)
 6. ["Least privilege" that quietly grants the whole project](#6-least-privilege-that-quietly-grants-the-whole-project)
-7. [Summary: where each fix is enforced](#7-summary-where-each-fix-is-enforced)
+7. [The trigger that fires but never runs](#7-the-trigger-that-fires-but-never-runs)
+8. [Summary: where each fix is enforced](#8-summary-where-each-fix-is-enforced)
 
 ---
 
@@ -206,7 +207,68 @@ bq show --format=prettyjson "${PROJECT_ID}:ml_production" | grep -B1 sa-bqml-bat
 
 ---
 
-## 7. Summary: where each fix is enforced
+## 7. The trigger that fires but never runs
+
+**What goes wrong.** Cloud Scheduler starts a Cloud Run Job by sending a `POST` to the job's `:run` endpoint on the Cloud Run Admin API. Its HTTP target can sign that request with either an OIDC identity token or an OAuth access token. OIDC is what most examples show, because it is how you call your own Cloud Run *services* and Cloud Functions. Terraform accepts either one, `terraform apply` succeeds, and the console shows the scheduler job as enabled.
+
+But `run.googleapis.com` is a Google API, and Google APIs accept only OAuth access tokens. With `oidc_token`, every scheduled attempt is rejected with `401 UNAUTHENTICATED`. The job never starts, so it writes no logs, no trace, and no metrics.
+
+That last part is what made it silent. The pipeline's only alert policies watched metrics: PSI above `0.25`, and slot usage. A run that never starts writes neither, so neither alert could fire. On the reference deployment the first scheduled night produced no predictions and no email. We found the failure only because the day's partition was missing.
+
+**The fix, part 1: sign with OAuth.** The scheduler's service account keeps `roles/run.invoker` on the job; only the token type changes:
+
+```hcl
+# terraform/cloud_scheduler.tf
+  http_target {
+    http_method = "POST"
+    uri         = "https://${var.region}-run.googleapis.com/v2/projects/${var.project_id}/locations/${var.region}/jobs/${google_cloud_run_v2_job.inference_job.name}:run"
+
+    # OAuth, not OIDC. This URI is a Google API (*.googleapis.com), and Google
+    # APIs only accept OAuth access tokens. An oidc_token here is rejected with
+    # 401 UNAUTHENTICATED at every scheduled attempt, so the job silently never
+    # runs. OIDC is for calling your own Cloud Run services or functions.
+    oauth_token {
+      service_account_email = google_service_account.scheduler_sa.email
+      scope                 = "https://www.googleapis.com/auth/cloud-platform"
+    }
+  }
+```
+
+**The fix, part 2: alerts that do not need the job's metrics.** Three log-based policies in [`terraform/monitoring.tf`](../terraform/monitoring.tf) cover the cases a metric alert cannot see:
+
+* **`STATUS: BQML Batch Run Finished`** emails the result of *every* run. In its `finally` block, [`src/orchestrator.py`](../src/orchestrator.py) writes one structured log entry with `event: pipeline_run_summary`, built by [`src/run_summary.py`](../src/run_summary.py). The policy matches that entry, and the email subject reads `[BQML batch] SUCCEEDED for 2026-10-06` (or `HALTED`, or `FAILED`). The first line of the body is a plain-language message, for example *"SUCCEEDED: scored 69,817 rows for 2026-10-06 in 12s. Drift PSI 0.0044 (threshold 0.25). ROC-AUC 0.7906."* `HALTED` and `FAILED` messages also say what to do next.
+* **`ALERT: BQML Batch Job Crashed Without a Status`** is the backstop for runs that end before the summary is written: a configuration error at start-up (`exit(1)`), a signal, or running out of memory. It deliberately ignores exit codes `0`, `2`, and `3`, which the status email already reports, so a drift halt sends one email, not two.
+* **`ALERT: Scheduler Failed to Start the BQML Batch Job`** fires on any Cloud Scheduler log entry at `ERROR` or above for this trigger, which is exactly what the 401 above produced.
+
+The recipient is `var.notification_email`, which the Makefile fills from `NOTIFICATION_EMAIL`. No address is written into the repository.
+
+Log-match alerts have two settings worth knowing. `notification_rate_limit` has a five-minute minimum, so two runs less than five minutes apart produce one email, not two; space manual test runs further apart than that. `auto_close` has a 30-minute minimum, which is why the status incident closes itself shortly after each run.
+
+**Where it is enforced.** [`terraform/cloud_scheduler.tf`](../terraform/cloud_scheduler.tf) and [`terraform/monitoring.tf`](../terraform/monitoring.tf). [`tests/test_terraform_contract.py`](../tests/test_terraform_contract.py) fails if the scheduler goes back to `oidc_token`, if the status policy's filter or label names drift from the fields `src/run_summary.py` writes, or if an email address appears in any `.tf` file. [`tests/test_run_summary.py`](../tests/test_run_summary.py) and [`tests/test_orchestrator.py`](../tests/test_orchestrator.py) check the message for each outcome, and that exactly one summary is logged on success and that a guardrail halt still logs one.
+
+**Check it yourself.** Confirm the token type, then start the job the way the nightly schedule does:
+
+```bash
+gcloud scheduler jobs describe trigger-bqml-taxi-batch-scoring \
+  --location="${GCP_REGION}" --format="value(httpTarget.oauthToken.scope)"
+# expect: https://www.googleapis.com/auth/cloud-platform
+
+gcloud scheduler jobs run trigger-bqml-taxi-batch-scoring --location="${GCP_REGION}"
+```
+
+A few minutes later the status email arrives, and the summary is in the logs:
+
+```bash
+gcloud logging read 'resource.type="cloud_run_job" AND jsonPayload.event="pipeline_run_summary"' \
+  --limit=1 --format="value(jsonPayload.status_message)"
+# expect: SUCCEEDED: scored ... rows for <yesterday> ...
+```
+
+If no email arrives, check that the notification channel under *Monitoring → Alerting → Edit notification channels* is verified, and look in your spam folder for mail from `alerting-noreply@google.com`.
+
+---
+
+## 8. Summary: where each fix is enforced
 
 | Gotcha | Fix lives in | Guarded by |
 | :--- | :--- | :--- |
@@ -216,5 +278,6 @@ bq show --format=prettyjson "${PROJECT_ID}:ml_production" | grep -B1 sa-bqml-bat
 | 4. 5-second metric write limit | [`src/telemetry.py`](../src/telemetry.py), [`src/config.py`](../src/config.py) | [`tests/test_config.py`](../tests/test_config.py) |
 | 5. Region vs. location | [`terraform/cloud_run.tf`](../terraform/cloud_run.tf) | [`tests/test_orchestrator.py`](../tests/test_orchestrator.py) |
 | 6. Project-wide data role | [`terraform/iam.tf`](../terraform/iam.tf) | Manual check above |
+| 7. Trigger that never runs | [`terraform/cloud_scheduler.tf`](../terraform/cloud_scheduler.tf), [`terraform/monitoring.tf`](../terraform/monitoring.tf), [`src/run_summary.py`](../src/run_summary.py) | [`tests/test_terraform_contract.py`](../tests/test_terraform_contract.py), [`tests/test_run_summary.py`](../tests/test_run_summary.py) |
 
 All the tests run offline with `make test`.

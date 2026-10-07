@@ -379,3 +379,14 @@ def test_no_alert_recipient_is_hardcoded():
                 if not m.endswith((".iam.gserviceaccount.com", "example.com"))]
         assert not hits, f"{tf_file.name}: {hits}"
     assert "var.notification_email" in _monitoring_tf()
+
+
+def test_scheduler_calls_the_run_api_with_an_oauth_token():
+    """The :run URI is a Google API, which accepts only OAuth access tokens. An
+    oidc_token applies cleanly and then fails every night with 401
+    UNAUTHENTICATED, so the job never starts (docs/production-gotchas.md, #7)."""
+    tf = re.sub(r"#.*", "", (TERRAFORM_DIR / "cloud_scheduler.tf").read_text())
+    assert "run.googleapis.com" in tf
+    assert "oauth_token" in tf
+    assert "oidc_token" not in tf
+    assert "https://www.googleapis.com/auth/cloud-platform" in tf

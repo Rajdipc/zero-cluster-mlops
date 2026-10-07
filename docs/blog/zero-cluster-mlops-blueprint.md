@@ -12,7 +12,8 @@ This is a complete, deployed blueprint for nightly batch scoring on Google Cloud
 * **A target leak lifted ROC-AUC from 0.77 to 0.81**, small enough to pass review. We show the check that catches it.
 * **Cash trips are 100.0% zero-tip**, because the meter never sees a cash tip. Filtering them out recovered more than a third of the signal.
 * **Closed PSI bins let 30% out-of-range data pass** the drift check. Open outer bins halt it.
-* **106 offline tests run in about a second**, including contract tests that keep Terraform and Python in agreement.
+* **118 offline tests run in about a second**, including contract tests that keep Terraform and Python in agreement.
+* **Every run emails its own result:** `SUCCEEDED`, `HALTED`, or `FAILED`, with one line on what happened and what to do. A job that crashes, or never starts, sends an alert too.
 
 **How to read it:**
 
@@ -94,7 +95,7 @@ Adding an ephemeral Cloud Run container is justified only when you need three ca
 
 1. **Imperative circuit breaking.** When input data drifts past a safe statistical threshold, you want the pipeline to log a structured error, emit a custom metric, and halt before writing corrupted predictions. Doing conditional branching and early exits in pure SQL scripts requires awkward `ASSERT` hacks that fail with opaque diagnostics.
 2. **Unified distributed tracing.** BigQuery's `INFORMATION_SCHEMA.JOBS` is great for auditing individual queries, but it does not give you a single waterfall trace where the pre-flight check, the drift computation, the model evaluation, and the batch prediction appear as child spans of one run, each annotated with slot milliseconds and correlated by trace ID to structured JSON logs.
-3. **Offline unit testing.** Date-window math, label-maturity lag, and configuration cross-checks are business logic. In Python, you can run 106 unit and contract tests in one second on a laptop with zero cloud access. In scheduled SQL, you usually discover bugs in production.
+3. **Offline unit testing.** Date-window math, label-maturity lag, and configuration cross-checks are business logic. In Python, you can run 118 unit and contract tests in one second on a laptop with zero cloud access. In scheduled SQL, you usually discover bugs in production.
 
 > 💡 **Bottom line:** The container is not there to process rows. It is there to enforce guardrails, manage control flow, and emit correlated telemetry while BigQuery does 100% of the heavy lifting.
 
@@ -378,7 +379,7 @@ def resolved_eval_date(self) -> str:
 
 ## Production Gotchas
 
-Here are six pitfalls we hit while building, auditing, and deploying this pipeline. Most of them looked perfectly fine in code review. Each one is summarized below. The [production gotchas runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md) has the full write-up: the code, what the failure looks like, and the test that keeps it from coming back.
+Here are seven pitfalls we hit while building, auditing, and deploying this pipeline. Most of them looked perfectly fine in code review. Each one is summarized below. The [production gotchas runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md) has the full write-up: the code, what the failure looks like, and the test that keeps it from coming back.
 
 ### 1. The Wall-Clock Partition Key Trap
 
@@ -410,6 +411,10 @@ Cloud Monitoring rejects two points on the same time series within **5 seconds**
 
 Many reference templates claim least privilege while granting `roles/bigquery.dataEditor` at the **project** level, which lets the batch worker overwrite or delete any dataset in the project. **The fix:** [`terraform/iam.tf`](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/terraform/iam.tf) grants only job submission and telemetry writing at project scope, and confines data changes to the `ml_production` dataset.
 
+### 7. The Trigger That Fires but Never Runs
+
+Cloud Scheduler can sign its request with an OIDC identity token or an OAuth access token. OIDC is what most examples show, because it is how you call your own Cloud Run *services*, and Terraform applies it without complaint. But a Cloud Run *Job* is started through the Cloud Run Admin API on `run.googleapis.com`, and Google APIs accept only OAuth access tokens. On our reference deployment the first scheduled night failed with `401 UNAUTHENTICATED`. The job never started, and no alert fired, because both alert policies watched metrics and a run that never starts writes none. **The fix:** sign with `oauth_token` and the `cloud-platform` scope, and add alerts that don't depend on the job's metrics: a status email at the end of every run, a backstop for crashes that end before that email is written, and an alert on scheduler errors. Stop 8 of the [Console Verification Tour](#8-alert-emails) shows what arrives.
+
 > 📂 *The code for each fix, and a way to check it on your own deployment, is in the [production gotchas runbook](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md). Complete Terraform modules for Cloud Run, Cloud Scheduler, IAM, and Cloud Monitoring alerts are in [`/terraform`](https://github.com/Rajdipc/zero-cluster-mlops/tree/main/terraform).*
 
 ---
@@ -429,7 +434,7 @@ export NOTIFICATION_EMAIL="you@example.com"
 
 # Each step is independently re-runnable. Run them in order the first time.
 make install      # create .venv, install pinned dependencies
-make test         # 106 unit tests, ~1s, NO cloud access and no billing
+make test         # 118 unit tests, ~1s, NO cloud access and no billing
 make seed         # DDL + load ~1.26M public rows + CREATE MODEL  (~4 min)
 make docker-push  # build image, create the Artifact Registry repo if absent, push
 make tf-apply ENABLE_ALERT_POLICIES=false  # first apply only (see below)
@@ -439,11 +444,11 @@ make tf-apply     # now add the two alert policies
 
 Here is what each step does:
 
-* **`make test`** runs all 106 unit and contract tests offline in about a second, at zero cost.
+* **`make test`** runs all 118 unit and contract tests offline in about a second, at zero cost.
 * **`make seed`** creates the `ml_production` dataset in the `US` multi-region, loads about 1.26 million public taxi rows, and trains the model (about 4 minutes, scanning about 1 GB, well inside the free tier).
 * **`make docker-push` and `make tf-apply`** build the container, create the two least-privilege service accounts, and provision the Cloud Run Job, the Cloud Scheduler trigger, and the alerts. `make deploy` runs both with a commit-pinned image tag. **No local Docker daemon?** `make deploy-cloudbuild` builds the same image on Cloud Build and then applies Terraform. The reference deployment for this post was built that way.
 * **`make execute`** runs the job once and waits for the result: `0` means success, `2` a guardrail halt, and `3` an unexpected, retryable failure.
-* **The second `make tf-apply`** adds the drift and cost alerts, which can only be created once the first run has produced their metrics: Cloud Monitoring refuses an alert policy for a custom metric it has never seen. Then open *Monitoring → Alerting → Notification channels*: if your email channel is marked **Unverified**, verify it, because an unverified channel delivers nothing.
+* **The second `make tf-apply`** adds the drift and cost alerts, which can only be created once the first run has produced their metrics: Cloud Monitoring refuses an alert policy for a custom metric it has never seen. Then open *Monitoring → Alerting → Notification channels*: if your email channel is marked **Unverified**, verify it, because an unverified channel delivers nothing. The three run-status alerts don't depend on custom metrics, so the first `make tf-apply` already creates them and your very first `make execute` sends a status email.
 
 You only need a `.env` file to run the orchestrator on your own machine with `make run-local` (`cp .env.example .env`). For deployment, the Makefile passes your exported variables straight to the seed script and Terraform.
 
@@ -457,7 +462,7 @@ Once `make deploy` (or `make deploy-cloudbuild`) and `make execute` have complet
 
 ### 1. Cloud Scheduler
 
-Open **Cloud Scheduler**, locate `trigger-bqml-taxi-batch-scoring`, and confirm the cron schedule (`0 2 * * *` UTC) and OIDC-authenticated HTTP target pointing to your Cloud Run Job's `:run` endpoint. Click **Force run** and refresh to see `Success`.
+Open **Cloud Scheduler**, locate `trigger-bqml-taxi-batch-scoring`, and confirm the cron schedule (`0 2 * * *` UTC) and the OAuth-authenticated HTTP target pointing to your Cloud Run Job's `:run` endpoint. Click **Force run** and refresh to see `Success`. If the result reads `UNAUTHENTICATED` instead, see Gotcha #7.
 
 ### 2. Cloud Run Jobs
 
@@ -523,6 +528,25 @@ Open **Monitoring → Metrics Explorer** to view the three custom time series ex
 * `workload.googleapis.com/bqml.evaluation.roc_auc` (tracks live accuracy against matured production labels).
 * `workload.googleapis.com/bqml.inference.slot_millis` (tracks warehouse compute per model).
 
+### 8. Alert emails
+
+Open **Monitoring → Alerting**. Under **Policies** you should see five entries. The two metric alerts, for PSI drift and slot usage, fire only when a run records a bad number. The three log-based alerts make sure that every night produces an email of some kind:
+
+* **STATUS: BQML Batch Run Finished.** The orchestrator ends every run, in its `finally` block, by writing one structured log entry with `event: pipeline_run_summary`. This policy turns that entry into an email whose subject carries the result and the date, such as `[BQML batch] SUCCEEDED for 2026-10-06`, and whose first line says what happened. `HALTED` means a guardrail stopped the run before anything was written; `FAILED` means an unexpected error that is safe to retry.
+* **ALERT: BQML Batch Job Crashed Without a Status.** A backstop for runs that die before they can write the summary, such as a configuration error at start-up or a container that runs out of memory. It ignores exit codes `0`, `2`, and `3`, which the status email already reports, so a halt sends one email, not two.
+* **ALERT: Scheduler Failed to Start the BQML Batch Job.** Fires when Cloud Scheduler gets an error back, so the failure in Gotcha #7 can't go unnoticed again.
+
+This is the first line of the status email from the reference deployment's verification run:
+
+> *SUCCEEDED: scored 69,817 rows for 2026-10-06 in 12s. Drift PSI 0.0044 (threshold 0.25). ROC-AUC 0.7906.*
+
+The recipient is whatever you exported as `NOTIFICATION_EMAIL`. No address is written into the repository, and a contract test fails if one ever appears in the Terraform files. The emails come from `alerting-noreply@google.com`, so check your spam folder for the first one. To read the same summaries without waiting for mail, run this query in Logs Explorer:
+
+```
+resource.type="cloud_run_job"
+jsonPayload.event="pipeline_run_summary"
+```
+
 ---
 
 ## Negative Testing: Proving the Guardrails Work
@@ -546,6 +570,8 @@ The container computes PSI, raises `DriftDetectedException`, records the error o
 SELECT COUNT(1) FROM `ml_production.taxi_predictions`
 WHERE scoring_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);
 ```
+
+Within a few minutes you also receive exactly one email, `[BQML batch] HALTED for <yesterday's date>`, whose first line gives the PSI value and says not to retry. The crash backstop ignores exit code `2`, so no second email follows.
 
 ### 2. Verify idempotency across repeated runs
 
