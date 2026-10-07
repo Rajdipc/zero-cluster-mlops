@@ -62,3 +62,16 @@ def test_structured_json_formatter_with_trace():
         )
         assert parsed["logging.googleapis.com/spanId"] == "00f067aa0ba902b7"
         assert parsed["logging.googleapis.com/trace_sampled"] is True
+
+
+def test_json_fields_land_at_the_top_level_of_the_payload():
+    """The run-status alert filters on jsonPayload.event, so extra fields must
+    not be nested or dropped by the formatter."""
+    formatter = StructuredJsonFormatter(project_id="test-project")
+    record = logging.LogRecord("t", logging.INFO, "t.py", 1, "done", (), None)
+    record.json_fields = {"event": "pipeline_run_summary", "status": "SUCCEEDED",
+                          "message": "must not overwrite the real message"}
+    parsed = json.loads(formatter.format(record))
+    assert parsed["event"] == "pipeline_run_summary"
+    assert parsed["status"] == "SUCCEEDED"
+    assert parsed["message"] == "done"

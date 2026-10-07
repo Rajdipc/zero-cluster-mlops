@@ -348,3 +348,34 @@ def test_alert_group_by_labels_are_recorded_as_attributes():
                 f"alert on {metric} groups by metric.label.{label}, but no metric "
                 f"attribute named '{label}' is ever recorded in src/."
             )
+
+
+# ==============================================================================
+# Run-status alert <-> run summary seam
+# ==============================================================================
+def _monitoring_tf() -> str:
+    return (TERRAFORM_DIR / "monitoring.tf").read_text()
+
+
+def test_run_status_alert_matches_the_summary_the_code_writes():
+    """If the event name or a field name drifts, the status email silently stops
+    (wrong filter) or arrives with blank fields (wrong extractor)."""
+    from src.run_summary import ALERT_FIELDS, RUN_SUMMARY_EVENT
+
+    tf = _monitoring_tf()
+    block = tf[tf.index('resource "google_monitoring_alert_policy" "run_status"'):]
+    block = block[:block.index("\nresource ")]
+    assert f'jsonPayload.event=\\"{RUN_SUMMARY_EVENT}\\"' in block
+    for name in ALERT_FIELDS:
+        assert f"EXTRACT(jsonPayload.{name})" in block, name
+        assert f"log.extracted_label.{name}" in block, name
+
+
+def test_no_alert_recipient_is_hardcoded():
+    """The repo is public; the only recipient is var.notification_email."""
+    email = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+    for tf_file in TERRAFORM_DIR.glob("*.tf"):
+        hits = [m for m in email.findall(tf_file.read_text())
+                if not m.endswith((".iam.gserviceaccount.com", "example.com"))]
+        assert not hits, f"{tf_file.name}: {hits}"
+    assert "var.notification_email" in _monitoring_tf()

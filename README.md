@@ -120,7 +120,7 @@ Run `make help` at any time to see every target and your current settings.
 | `roles/cloudscheduler.admin` | creating the nightly trigger |
 | `roles/iam.serviceAccountAdmin` | creating the two service accounts |
 | `roles/resourcemanager.projectIamAdmin` | binding the runner's four project-level roles |
-| `roles/monitoring.admin` | the notification channel and four alert policies |
+| `roles/monitoring.admin` | the notification channel and five alert policies |
 
 Enable the required APIs (one time, ~2 minutes to propagate):
 
@@ -142,7 +142,7 @@ gcloud services enable \
 | `run` | the ephemeral orchestrator container |
 | `cloudscheduler` | the 02:00 UTC nightly trigger |
 | `cloudtrace` | OpenTelemetry span export — the execution waterfall |
-| `monitoring` | custom PSI / ROC-AUC gauges and the four alert policies |
+| `monitoring` | custom PSI / ROC-AUC gauges and the five alert policies |
 | `logging` | structured, trace-correlated JSON logs |
 | `artifactregistry` | stores the container image |
 | `aiplatform` | **optional** — see the note below |
@@ -233,7 +233,7 @@ make install
 make test
 ```
 
-Expect **106 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
+Expect **117 passed** in under a second. This touches no cloud resources and costs nothing — if it asks for credentials, your checkout is wrong. Stop and investigate rather than proceeding.
 
 ### Step 5 — Seed BigQuery and train  ⚠️ *first step that costs money*
 
@@ -299,7 +299,7 @@ make tf-plan     # optional on a first run, but worth reading
 make tf-apply ENABLE_ALERT_POLICIES=false
 ```
 
-Fifteen resources in total, ~2 minutes. This first apply creates thirteen of them, including the two run-failure alerts; the two metric alert policies follow in Step 8, because their metrics do not exist until the job has run once:
+Sixteen resources in total, ~2 minutes. This first apply creates fourteen of them, including the three log-based status and failure alerts; the two metric alert policies follow in Step 8, because their metrics do not exist until the job has run once:
 
 | Resource | Detail |
 | :--- | :--- |
@@ -310,13 +310,13 @@ Fifteen resources in total, ~2 minutes. This first apply creates thirteen of the
 | `google_cloud_run_v2_job_iam_member` | `run.invoker` on **this one job only** |
 | `google_cloud_scheduler_job` | `0 2 * * *` UTC, OAuth-authenticated (the target is a Google API, which rejects OIDC tokens) |
 | `google_monitoring_notification_channel` | email → `$NOTIFICATION_EMAIL` |
-| `google_monitoring_alert_policy` ×2 | **Run failures** (log-based, created on the first apply): scheduler could not start the job; job exited non-zero |
+| `google_monitoring_alert_policy` ×3 | **Run status** (log-based, created on the first apply): a status email after every run; job crashed without a status; scheduler could not start the job |
 | `google_monitoring_alert_policy` ×2 | **Metrics** (created in Step 8): PSI drift > 0.25, slot-millis > 300000 |
 
 **Then check the notification channel.** In the reference deployment the email channel worked straight away: the API reports no `verificationStatus` for it, meaning verification does not apply. If the console ever marks the channel **Unverified**, open *Monitoring → Alerting → Edit notification channels* and send a verification code, because an unverified channel delivers nothing.
 
 > [!IMPORTANT]
-> **Terraform state is local.** There is no `backend` block in `terraform/versions.tf`, so `terraform.tfstate` lands in `terraform/` inside your Cloud Shell home directory. Home persists between sessions but **Cloud Shell deletes it after 120 days of inactivity**. Lose the state and Terraform no longer knows these fifteen resources exist — you would delete them by hand or `terraform import` each one.
+> **Terraform state is local.** There is no `backend` block in `terraform/versions.tf`, so `terraform.tfstate` lands in `terraform/` inside your Cloud Shell home directory. Home persists between sessions but **Cloud Shell deletes it after 120 days of inactivity**. Lose the state and Terraform no longer knows these sixteen resources exist — you would delete them by hand or `terraform import` each one.
 >
 > For anything beyond a demo, add a remote backend:
 >
@@ -422,13 +422,14 @@ zero-cluster-mlops/
 │   ├── drift.py                # Pre-flight volume check + PSI circuit breaker
 │   ├── evaluate.py             # Continuous evaluation against matured labels
 │   ├── inference.py            # Idempotent two-job scoring + FinOps telemetry
-│   └── orchestrator.py         # Entrypoint, exit codes, shutdown flush
+│   ├── run_summary.py          # One plain-language status line per run (feeds the status email)
+│   └── orchestrator.py         # Entrypoint, exit codes, run summary, shutdown flush
 │
 ├── terraform/
 │   ├── cloud_run.tf            # Cloud Run Job (max_retries, memory headroom)
 │   ├── cloud_scheduler.tf      # Daily OAuth-authenticated trigger
 │   ├── iam.tf                  # Dataset-scoped least-privilege identities
-│   ├── monitoring.tf           # Alert policies with triage runbooks
+│   ├── monitoring.tf           # Run-status email + alert policies with triage runbooks
 │   └── variables.tf / outputs.tf / provider.tf / versions.tf
 │
 ├── scripts/
@@ -441,7 +442,7 @@ zero-cluster-mlops/
 │   ├── blog/                   # Companion article (Markdown)
 │   └── images/                 # Rendered diagrams and data tables
 │
-└── tests/                      # 106 tests, no cloud access required
+└── tests/                      # 117 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose
     ├── test_feature_contract.py # cross-file SQL contract checks (see below)
     ├── test_terraform_contract.py # Terraform <-> container config seam
@@ -511,7 +512,7 @@ This is the question most batch-scoring tutorials skip, and it is the one that b
   (lands ~daily, before this job runs)
 ```
 
-The pipeline's job is to **fail loudly** when the partition it was asked to score is missing. That is what `MIN_ROW_COUNT` and the pre-flight check in `src/drift.py` are for. Exit code `2`, no predictions written, and the *Batch Job Exited Non-Zero* alert emails you. Silently scoring a half-loaded partition would be far worse.
+The pipeline's job is to **fail loudly** when the partition it was asked to score is missing. That is what `MIN_ROW_COUNT` and the pre-flight check in `src/drift.py` are for. Exit code `2`, no predictions written, and a `[BQML batch] HALTED` status email tells you why. Silently scoring a half-loaded partition would be far worse.
 
 > [!WARNING]
 > **The default `MIN_ROW_COUNT=1` is a presence check, not a volume floor.** It catches a partition that is entirely absent and nothing else; a partition at 10% of normal volume passes. That default exists because this repo cannot know your data. Once you do, raise it — the p50 row count per partition over the last 30 days, halved, is a reasonable starting point:
@@ -533,7 +534,7 @@ This demo reads `bigquery-public-data`, which is **frozen in 2022**, so nothing 
 >
 > `make help` prints the current value, so you can confirm it before applying.
 
-With demo ingestion disabled, a missing partition behaves the way it should: the pre-flight check halts the run with exit code `2` and the *Batch Job Exited Non-Zero* alert in `terraform/monitoring.tf` emails you.
+With demo ingestion disabled, a missing partition behaves the way it should: the pre-flight check halts the run with exit code `2` and the run-status alert in `terraform/monitoring.tf` emails you a `HALTED` message naming the empty partition.
 
 ---
 
@@ -634,6 +635,27 @@ GROUP BY scoring_date ORDER BY scoring_date;
 * **Metrics Explorer** → `workload.googleapis.com/bqml.drift.feature_psi`, `bqml.evaluation.roc_auc`, `bqml.inference.slot_millis`.
 * **Logs Explorer** → `resource.type="cloud_run_job"`; every entry carries `logging.googleapis.com/trace`.
 
+### Status emails
+
+Every run ends with one structured log line (`jsonPayload.event="pipeline_run_summary"`), and the **STATUS: BQML Batch Run Finished** policy emails it to `$NOTIFICATION_EMAIL`. The subject tells you the outcome before you open it:
+
+| Subject | Meaning | What to do |
+| :--- | :--- | :--- |
+| `[BQML batch] SUCCEEDED for 2026-10-06` | Scored; the body gives rows, PSI and ROC-AUC | Nothing |
+| `[BQML batch] HALTED for 2026-10-06` | A guardrail stopped the run before any write | Fix the input data; do not retry |
+| `[BQML batch] FAILED for 2026-10-06` | Unexpected error (BigQuery 5xx, quota, network) | Re-run the same `TARGET_DATE`; writes are idempotent |
+| `[BQML batch] CRASHED: ...` | The container died before it could report (bad config, OOM, signal) | Read the execution's first ERROR line |
+| `[BQML batch] NOT STARTED: ...` | Cloud Scheduler could not start the job | See the troubleshooting row for `UNAUTHENTICATED` |
+
+To see the summary lines yourself:
+
+```
+resource.type="cloud_run_job"
+jsonPayload.event="pipeline_run_summary"
+```
+
+Emails come from `alerting-noreply@google.com`. If the first one lands in spam, mark it as not spam once. The recipient is whatever you pass as `NOTIFICATION_EMAIL`; nothing in the repo hardcodes an address.
+
 ---
 
 ## Exit Codes
@@ -669,7 +691,7 @@ Why the codes are split this way, and a one-line check of the retry setting on y
 | Seeded successfully but every partition is empty | Pointed at `tlc_yellow_trips_2023`, which **exists but has 0 rows** | Use 2011–2022. Only those are populated |
 | Predictions in today's partition after a backfill | Partitioned on `scored_at` | Partition on `scoring_date` |
 | No execution at 02:00 UTC; scheduler log shows `UNAUTHENTICATED` / 401 | Scheduler sends an OIDC token to the Cloud Run Admin API | Use `oauth_token` with the `cloud-platform` scope (shipped in `terraform/cloud_scheduler.tf`) |
-| Job failed but no email arrived | Only the drift and slot alerts existed; they need the job to emit metrics | The two run-failure alerts in `terraform/monitoring.tf` cover a missed start and any non-zero exit |
+| Job failed but no email arrived | Only the drift and slot alerts existed; they need the job to emit metrics | The log-based alerts in `terraform/monitoring.tf` send a status email for every run, plus alerts for a crash or a missed start |
 
 Several of these rows (location, metric interval, script jobs, backfill partition) are written up in full, with the code and a check you can run, in [Production Gotchas](docs/production-gotchas.md).
 
@@ -688,7 +710,7 @@ Several of these rows (location, metric interval, script jobs, backfill partitio
 ## Cleanup
 
 ```bash
-make tf-destroy        # the 15 Terraform-managed resources (needs terraform/terraform.tfstate)
+make tf-destroy        # the 16 Terraform-managed resources (needs terraform/terraform.tfstate)
 
 gcloud artifacts repositories delete bqml-batch-inference \
   --location="${GCP_REGION}" --project="${GCP_PROJECT_ID}" --quiet

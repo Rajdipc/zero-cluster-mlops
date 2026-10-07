@@ -70,6 +70,14 @@ class StructuredJsonFormatter(logging.Formatter):
         if record.exc_info:
             log_entry["exception"] = self.formatException(record.exc_info)
 
+        # Structured fields passed as logger.info(..., extra={"json_fields": {...}})
+        # land at the top level of jsonPayload, where log-based alert policies
+        # can filter on them and extract them into notifications.
+        json_fields = getattr(record, "json_fields", None)
+        if isinstance(json_fields, dict):
+            for key, value in json_fields.items():
+                log_entry.setdefault(key, value)
+
         return json.dumps(log_entry)
 
     @staticmethod

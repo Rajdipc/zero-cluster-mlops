@@ -172,3 +172,37 @@ def test_bigquery_client_uses_the_dataset_location_not_the_run_region(pipeline, 
     _, kwargs = pipeline["client"].call_args
     assert kwargs["location"] == "US"
     assert kwargs["project"] == "test-proj"
+
+
+# ==============================================================================
+# Run summary: the line the run-status email is built from
+# ==============================================================================
+def _summaries(caplog):
+    return [r for r in caplog.records
+            if getattr(r, "json_fields", {}).get("event") == "pipeline_run_summary"]
+
+
+def test_success_writes_exactly_one_run_summary(pipeline, caplog):
+    caplog.set_level("INFO")  # setup_telemetry (which sets INFO) is mocked out
+    pipeline["drift"].return_value = 0.0123
+    pipeline["evaluate"].return_value = {"roc_auc": 0.79}
+    pipeline["inference"].return_value = {"rows_scored": 69817}
+
+    assert run_main() == EXIT_OK
+
+    (record,) = _summaries(caplog)
+    assert record.levelname == "INFO"
+    assert record.json_fields["status"] == "SUCCEEDED"
+    assert record.json_fields["rows_scored"] == 69817
+    assert record.getMessage().startswith("SUCCEEDED: scored 69,817 rows")
+
+
+def test_guardrail_halt_still_writes_a_run_summary(pipeline, caplog):
+    pipeline["drift"].side_effect = DriftDetectedException("PSI 0.45")
+
+    assert run_main() == EXIT_GUARDRAIL_HALT
+
+    (record,) = _summaries(caplog)
+    assert record.levelname == "ERROR"
+    assert record.json_fields["status"] == "HALTED"
+    assert record.json_fields["exit_code"] == "2"

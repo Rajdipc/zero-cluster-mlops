@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import time
 
 from google.cloud import bigquery
 from opentelemetry import trace
@@ -15,6 +16,7 @@ from src.drift import (
 from src.evaluate import run_model_evaluation
 from src.inference import run_batch_inference
 from src.ingest import run_demo_ingestion
+from src.run_summary import STATUS_SUCCEEDED, RunSummary
 from src.telemetry import setup_telemetry
 
 logger = logging.getLogger("bqml_orchestrator")
@@ -31,6 +33,12 @@ def main() -> None:
     config = PipelineConfig()
     tracer_provider, meter_provider = setup_telemetry(config)
     exit_code = EXIT_OK
+    started = time.monotonic()
+    summary = RunSummary(
+        target_date=config.resolved_target_date,
+        psi_threshold=config.psi_drift_threshold,
+    )
+    failure: BaseException | None = None
 
     try:
         # BigQuery location is intentionally separate from the Cloud Run region:
@@ -60,13 +68,17 @@ def main() -> None:
             run_demo_ingestion(client, config)
 
             logger.info("Phase 1/3: Pre-flight validation and PSI drift guardrail...")
-            run_drift_guardrail(client, config)
+            summary.psi = run_drift_guardrail(client, config)
 
             logger.info("Phase 2/3: Continuous evaluation against realized labels...")
-            run_model_evaluation(client, config)
+            eval_metrics = run_model_evaluation(client, config)
+            if eval_metrics:
+                summary.roc_auc = eval_metrics.get("roc_auc")
 
             logger.info("Phase 3/3: Idempotent push-down batch scoring...")
-            run_batch_inference(client, config)
+            scored = run_batch_inference(client, config)
+            if isinstance(scored, dict):
+                summary.rows_scored = scored.get("rows_scored")
 
             logger.info("Pipeline completed successfully.")
             root_span.set_status(trace.StatusCode.OK)
@@ -77,6 +89,7 @@ def main() -> None:
         # max_retries=0 in Terraform so Cloud Run does not duplicate the run.
         logger.error(f"Guardrail halted the pipeline: {exc}")
         exit_code = EXIT_GUARDRAIL_HALT
+        failure = exc
 
     except Exception as exc:
         # Potentially transient (BigQuery 5xx, quota, network). Distinguished by
@@ -85,8 +98,19 @@ def main() -> None:
         # safe: the partition is cleared before it is repopulated.
         logger.error(f"Pipeline failed with an unexpected error: {exc}", exc_info=True)
         exit_code = EXIT_UNEXPECTED
+        failure = exc
 
     finally:
+        # One human-readable status line per run. The "BQML Batch Run Status"
+        # alert policy emails it, so it must be written on every path, and
+        # before the flush so it is never lost to the CPU freeze below.
+        try:
+            fields = summary.build(exit_code, time.monotonic() - started, failure)
+            level = logging.INFO if fields["status"] == STATUS_SUCCEEDED else logging.ERROR
+            logger.log(level, fields["status_message"], extra={"json_fields": fields})
+        except Exception as summary_exc:  # never mask the real exit code
+            logger.warning(f"Could not write the run summary: {summary_exc}")
+
         # CRITICAL: Cloud Run freezes container vCPUs the instant the main
         # thread exits, killing OTel background exporter threads and dropping
         # anything still buffered. shutdown() blocks until spans and metrics
