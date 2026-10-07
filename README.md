@@ -656,6 +656,13 @@ jsonPayload.event="pipeline_run_summary"
 
 Emails come from `alerting-noreply@google.com`. If the first one lands in spam, mark it as not spam once. The recipient is whatever you pass as `NOTIFICATION_EMAIL`; nothing in the repo hardcodes an address.
 
+**Sending halts and failures to an incident tool.** No pipeline change is needed. Add a [notification channel](https://cloud.google.com/monitoring/support/notification-options) for PagerDuty, Slack, Google Chat, Pub/Sub, or a webhook (for example, to ServiceNow or Jira Service Management) and attach it to:
+
+- the **CRASHED** and **NOT STARTED** policies as-is, because they fire only on failures;
+- a copy of the **STATUS** policy whose filter adds `severity>=ERROR`. The summary line is logged at `ERROR` only for `HALTED` and `FAILED` runs, so successful runs don't open tickets.
+
+Each alert is already a Cloud Monitoring incident (*Monitoring → Alerting → Incidents*) carrying the same subject and message as the email.
+
 ---
 
 ## Exit Codes

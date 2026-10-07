@@ -547,6 +547,13 @@ resource.type="cloud_run_job"
 jsonPayload.event="pipeline_run_summary"
 ```
 
+**Opening an incident ticket instead of (or as well as) an email.** Email is only the default channel. Cloud Monitoring can send the same alerts to [PagerDuty, Slack, Google Chat, a webhook, or a Pub/Sub topic](https://cloud.google.com/monitoring/support/notification-options), and a webhook pointed at an ITSM tool such as ServiceNow or Jira Service Management opens a ticket where your on-call team already works. Nothing changes in the pipeline; you add a notification channel and attach it to the right policies:
+
+* **Crash and scheduler alerts:** attach the channel as-is. They fire only when something went wrong.
+* **Status alert:** it fires after every run, including successful ones, so make a copy whose filter adds `severity>=ERROR`. The run summary is logged at `ERROR` only for `HALTED` and `FAILED` runs, so the copy opens a ticket for those and stays quiet on success.
+
+Each alert is already an incident in Cloud Monitoring, with its own ID, an open or closed state, and the same subject and message you see in the email (see the screenshot below, and the HALTED email in the drift test that follows). The webhook delivers that incident as JSON, so the ticket can carry the date, the reason, and the next step without anyone retyping them.
+
 ---
 
 ## Negative Testing: Proving the Guardrails Work
@@ -674,6 +681,7 @@ What separates a quick demo from a dependable production pipeline is rarely the 
 ### Serverless Execution & Orchestration
 * [Overview of Cloud Run Jobs](https://cloud.google.com/run/docs/create-jobs)
 * [Cloud Run Jobs Execution Lifecycle & Task Retries](https://cloud.google.com/run/docs/execute/jobs)
+* [Cloud Monitoring Notification Channels (PagerDuty, Slack, Webhooks, Pub/Sub)](https://cloud.google.com/monitoring/support/notification-options)
 * [Production gotchas for this blueprint: failure modes, fixes, and the tests that guard them](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/production-gotchas.md)
 
 ### OpenTelemetry & Google Cloud Observability
