@@ -439,8 +439,7 @@ zero-cluster-mlops/
 ├── docs/
 │   ├── data-notes.md           # Dataset, the two data bugs, Phase 0 in full
 │   ├── production-gotchas.md   # Seven failure modes: fix, test, how to check
-│   ├── blog/                   # Companion article (Markdown)
-│   └── images/                 # Rendered diagrams and data tables
+│   └── images/                 # Data tables used by data-notes.md
 │
 └── tests/                      # 119 tests, no cloud access required
     ├── helpers.py              # strip_sql_comments -- assertions must not match prose

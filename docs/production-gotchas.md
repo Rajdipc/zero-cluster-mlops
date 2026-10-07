@@ -1,6 +1,6 @@
 # Production Gotchas: The Full Write-Up
 
-This runbook holds the detail behind the seven "Production Gotchas" in the [Zero-Cluster MLOps blueprint](https://github.com/Rajdipc/zero-cluster-mlops). The [companion blog post](https://github.com/Rajdipc/zero-cluster-mlops/blob/main/docs/blog/zero-cluster-mlops-blueprint.md) gives a short summary of each one. Here you get, for each gotcha, what goes wrong, the fix with the shipped code, where the repository enforces it, and a command to confirm it on your own deployment.
+This runbook holds the detail behind the seven "Production Gotchas" in the [Zero-Cluster MLOps blueprint](https://github.com/Rajdipc/zero-cluster-mlops). The companion blog post gives a short summary of each one. Here you get, for each gotcha, what goes wrong, the fix with the shipped code, where the repository enforces it, and a command to confirm it on your own deployment.
 
 The commands assume the default names from `terraform/variables.tf` (job `bqml-taxi-batch-worker`, dataset `ml_production`) and that `PROJECT_ID` and `GCP_REGION` are set as in the [Cloud Shell runbook](../README.md#deploying-from-google-cloud-shell).
 
