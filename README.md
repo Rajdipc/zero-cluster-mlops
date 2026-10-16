@@ -1,11 +1,28 @@
 # Zero-Cluster MLOps: BigQuery ML + Cloud Run Jobs + OpenTelemetry
 
-[![GCP](https://img.shields.io/badge/Google%20Cloud-BigQuery%20ML%20%7C%20Cloud%20Run-4285F4?logo=google-cloud&logoColor=white)](#)
-[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Tracing%20%26%20Metrics-F5A800?logo=opentelemetry&logoColor=white)](#)
-[![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)](#)
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](#)
+[![GCP](https://img.shields.io/badge/Google%20Cloud-BigQuery%20ML%20%7C%20Cloud%20Run-4285F4?logo=google-cloud&logoColor=white)](https://cloud.google.com/bigquery/docs/bqml-introduction)
+[![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Tracing%20%26%20Metrics-F5A800?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
+[![Terraform](https://img.shields.io/badge/IaC-Terraform-7B42BC?logo=terraform&logoColor=white)](terraform/)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](src/)
+[![Medium](https://img.shields.io/badge/Medium-Google%20Cloud%20Publication-black?logo=medium&logoColor=white)](https://medium.com/google-cloud/2f3ed6a580fe)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://console.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/Rajdipc/zero-cluster-mlops.git&cloudshell_open_in_editor=README.md)
+
+> 📰 **Companion Technical Deep Dive (Google Cloud Community):** **[The Zero-Cluster MLOps Blueprint: BigQuery ML, Cloud Run Jobs, and OpenTelemetry](https://medium.com/google-cloud/2f3ed6a580fe)**  
+> ⭐ *If you find this zero-cluster blueprint and production runbook useful, please **star this repository**!*
 
 Production-grade batch ML inference executed **inside** BigQuery, orchestrated by an ephemeral Cloud Run Job, instrumented end-to-end with OpenTelemetry. No persistent clusters, no data movement tier.
+
+![Zero-Cluster MLOps Architecture Overview](docs/images/diagram_1_shape_of_it.png)
+
+<details>
+<summary><strong>Expand Detailed End-to-End Architecture & OpenTelemetry Flush Lifecycle Diagrams</strong></summary>
+
+![Detailed Zero-Cluster MLOps Architecture](docs/images/diagram_2_architecture_detail.png)
+
+![OpenTelemetry CPU-Throttling Flush Lifecycle on Cloud Run Jobs](docs/images/diagram_3_otel_freeze_trap.png)
+
+</details>
 
 **Contents**
 
